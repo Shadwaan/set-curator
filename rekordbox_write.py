@@ -151,6 +151,12 @@ def resolve_content_ids(db, tracks: list[dict]) -> tuple[list[str], list[dict]]:
 def write_playlist(name: str, tracks: list[dict], append: bool = False) -> dict:
     """Create playlist `name` holding `tracks` (tracks.json entries) in order.
     If it already exists: refuse, or with append=True add the tracks it lacks."""
+    return write_playlists([(name, tracks)], append=append)[0]
+
+
+def write_playlists(playlists: list[tuple[str, list[dict]]], append: bool = False) -> list[dict]:
+    """Write several playlists in one transaction with one backup: either all
+    are written or none. They end up at the top of the tree in the given order."""
     from pyrekordbox.db6 import tables
 
     # The check guards the live library; a SET_CURATOR_RB_DIR copy is safe to write.
@@ -159,49 +165,56 @@ def write_playlist(name: str, tracks: list[dict], append: bool = False) -> dict:
 
     backup = backup_master_db()
     db = open_db()
+    results = []
     try:
-        content_ids, missing = resolve_content_ids(db, tracks)
-
-        playlist = db.session.query(tables.DjmdPlaylist).filter_by(Name=name).first()
-        created = playlist is None
-        if playlist and not append:
-            raise RuntimeError(f"Playlist '{name}' already exists (use --append to add to it)")
-        if created:
-            for pl in db.session.query(tables.DjmdPlaylist).filter_by(ParentID="root").all():
-                if pl.Seq is not None:
-                    pl.Seq += 1
-            playlist = tables.DjmdPlaylist()
-            playlist.ID = _new_id(db, tables.DjmdPlaylist, 1, 2**32 - 1)
-            playlist.Name = name
-            playlist.Seq = 0
-            playlist.Attribute = 0
-            playlist.ParentID = "root"
-            _sync_fields(playlist, _next_usn(db, tables.DjmdPlaylist))
-            db.session.add(playlist)
-            db.session.flush()
-
-        existing = {str(s.ContentID): s.TrackNo or 0
-                    for s in db.session.query(tables.DjmdSongPlaylist).filter_by(PlaylistID=playlist.ID)}
-        track_no = max(existing.values(), default=0)
+        playlist_usn = _next_usn(db, tables.DjmdPlaylist)
         usn = _next_usn(db, tables.DjmdSongPlaylist)
-        added = 0
-        for cid in content_ids:
-            if cid in existing:
-                continue
-            track_no += 1
-            song = tables.DjmdSongPlaylist()
-            song.ID = _new_id(db, tables.DjmdSongPlaylist, 10**9, 10**10 - 1)
-            song.PlaylistID = playlist.ID
-            song.ContentID = cid
-            song.TrackNo = track_no
-            _sync_fields(song, usn)
-            usn += 1
-            db.session.add(song)
-            existing[cid] = track_no
-            added += 1
+        # each new playlist is inserted at Seq=0, so create them last-first
+        for name, tracks in reversed(playlists):
+            content_ids, missing = resolve_content_ids(db, tracks)
+
+            playlist = db.session.query(tables.DjmdPlaylist).filter_by(Name=name).first()
+            created = playlist is None
+            if playlist and not append:
+                raise RuntimeError(f"Playlist '{name}' already exists (use --append to add to it)")
+            if created:
+                for pl in db.session.query(tables.DjmdPlaylist).filter_by(ParentID="root").all():
+                    if pl.Seq is not None:
+                        pl.Seq += 1
+                playlist = tables.DjmdPlaylist()
+                playlist.ID = _new_id(db, tables.DjmdPlaylist, 1, 2**32 - 1)
+                playlist.Name = name
+                playlist.Seq = 0
+                playlist.Attribute = 0
+                playlist.ParentID = "root"
+                _sync_fields(playlist, playlist_usn)
+                playlist_usn += 1
+                db.session.add(playlist)
+                db.session.flush()
+
+            existing = {str(s.ContentID): s.TrackNo or 0
+                        for s in db.session.query(tables.DjmdSongPlaylist).filter_by(PlaylistID=playlist.ID)}
+            track_no = max(existing.values(), default=0)
+            added = 0
+            for cid in content_ids:
+                if cid in existing:
+                    continue
+                track_no += 1
+                song = tables.DjmdSongPlaylist()
+                song.ID = _new_id(db, tables.DjmdSongPlaylist, 10**9, 10**10 - 1)
+                song.PlaylistID = playlist.ID
+                song.ContentID = cid
+                song.TrackNo = track_no
+                _sync_fields(song, usn)
+                usn += 1
+                db.session.add(song)
+                existing[cid] = track_no
+                added += 1
+            db.session.flush()
+            results.append({"name": name, "playlist_id": str(playlist.ID), "created": created,
+                            "added": added, "missing": missing, "backup": str(backup)})
 
         db.session.commit()
-        playlist_id = str(playlist.ID)
     except Exception:
         db.session.rollback()
         raise
@@ -209,8 +222,8 @@ def write_playlist(name: str, tracks: list[dict], append: bool = False) -> dict:
         db.session.close()
         db.engine.dispose()
 
-    if created:
-        _register_playlist_in_xml(playlist_id)
+    for r in results:
+        if r["created"]:
+            _register_playlist_in_xml(r["playlist_id"])
     flush_wal()
-    return {"playlist_id": playlist_id, "created": created, "added": added,
-            "missing": missing, "backup": str(backup)}
+    return results[::-1]

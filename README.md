@@ -6,8 +6,8 @@ track into a 1280-dimension embedding, and tracks are compared by cosine
 similarity. Everything runs locally on your files.
 
 `export_tracks.py` reads Rekordbox from a temp copy of `master.db`. The only
-thing that writes to Rekordbox is `make_playlist.py --apply`, which adds a
-playlist and never deletes anything.
+things that write to Rekordbox are `make_playlist.py --apply` and
+`cluster.py --apply`, which add playlists and never delete anything.
 
 ## Pipeline
 
@@ -17,6 +17,7 @@ playlist and never deletes anything.
 | 2. Compute embeddings into `embeddings.npz` (incremental) | `embed.py` | Essentia (macOS or Linux; on Windows use WSL) |
 | 3. Show nearest neighbours | `similar.py` | `numpy` |
 | 4. Build a playlist from weighted seeds, write it to Rekordbox | `make_playlist.py` + `rekordbox_write.py` | `pyrekordbox`, `psutil` |
+| 5. Auto-group the library into sound + tempo playlists, write them to Rekordbox | `cluster.py` + `rekordbox_write.py` | `scikit-learn`, `pyrekordbox`, `psutil` |
 
 ## Setup (macOS)
 
@@ -26,7 +27,7 @@ on older macOS, pip falls back to an older wheel automatically.
 ```bash
 ./setup_essentia.sh          # venv at ~/.venvs/set-curator + model download
 PY=~/.venvs/set-curator/bin/python
-$PY -m pip install pyrekordbox psutil   # for export + writing playlists
+$PY -m pip install pyrekordbox psutil scikit-learn   # export, writing playlists, auto-grouping
 ```
 
 ## Usage
@@ -60,9 +61,9 @@ by exported ID when the file name agrees, else by unique file name, so a
 `tracks.json` from another machine still resolves; anything unmatched is listed.
 
 Works on Windows and macOS (Rekordbox folder and process name are detected per
-platform). Tested on Windows so far; on a new machine, try it against a copy
-first -- `SET_CURATOR_RB_DIR` points everything at a folder holding `master.db`
-and `masterPlaylists6.xml`:
+platform); used on Windows and on macOS with Rekordbox 7.2.18. On a new
+machine, try it against a copy first -- `SET_CURATOR_RB_DIR` points everything
+at a folder holding `master.db` and `masterPlaylists6.xml`:
 
 ```bash
 mkdir -p ~/rb-test && cp ~/Library/Pioneer/rekordbox/{master.db,masterPlaylists6.xml} ~/rb-test/
@@ -70,6 +71,27 @@ SET_CURATOR_RB_DIR=~/rb-test $PY make_playlist.py "some track" --size 10 --name 
 ```
 
 If the copy looks right, run without `SET_CURATOR_RB_DIR` (Rekordbox closed).
+
+### Auto-grouping the whole library
+
+```bash
+$PY cluster.py            # preview: every playlist with its tracks' BPMs
+$PY cluster.py --apply    # write them all into Rekordbox ("SC 01 ...", "SC 02 ...")
+```
+
+Tracks are first grouped by sound (k-means on the embeddings, `--size` tracks
+per group), then each group is split into tempo bands no wider than
+`--bpm-width` (default 8). Half/double time counts: within a group, a track's
+BPM is read as half, as-is or double, whichever is nearest the group's median,
+so an 80 in a 160 dub group sits with the 160s (marked `*` in the preview).
+Bands smaller than `--min` go to the closest-sounding band they fit tempo-wise;
+anything that fits nowhere ends up in "Other tempos".
+
+Each playlist is named after the existing Rekordbox playlist most specific to
+it plus its BPM range. Missing files, Rekordbox's built-in sampler sounds and
+duplicate copies of the same audio (the lossless copy is kept) are left out.
+All playlists are written in one transaction with one backup, so either all
+are created or none.
 
 ### Files on another machine
 
