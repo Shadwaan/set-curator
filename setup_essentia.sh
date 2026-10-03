@@ -17,6 +17,10 @@ python3 -m venv "$VENV"
 mkdir -p models
 curl -fL -o models/discogs-effnet-bs64-1.pb \
   https://essentia.upf.edu/models/feature-extractors/discogs-effnet/discogs-effnet-bs64-1.pb
+# Discogs-400 style classifier, used by cluster.py to name groups
+for f in genre_discogs400-discogs-effnet-1.pb genre_discogs400-discogs-effnet-1.json; do
+  curl -fL -o "models/$f" "https://essentia.upf.edu/models/classification-heads/genre_discogs400/$f"
+done
 
 "$VENV/bin/python" -c "import essentia; print('essentia', essentia.__version__, 'OK')"
 echo "Venv: $VENV   (run scripts with $VENV/bin/python)"

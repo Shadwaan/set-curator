@@ -91,7 +91,8 @@ def _sync_fields(row, usn: int):
     row.updated_at = now
 
 
-def _register_playlist_in_xml(playlist_id: str):
+def _register_playlist_in_xml(playlist_id: str, parent_id: str = "root", attribute: int = 0):
+    """Nodes are a flat list; nesting is expressed by ParentId (hex, "0" = root)."""
     xml_path = rekordbox_dir() / "masterPlaylists6.xml"
     if not xml_path.exists():
         print(f"warning: {xml_path} not found -- playlist may appear empty in Rekordbox")
@@ -105,7 +106,8 @@ def _register_playlist_in_xml(playlist_id: str):
     if any(n.get("Id") == id_hex for n in playlists.findall("NODE")):
         return
     ET.SubElement(playlists, "NODE", {
-        "Id": id_hex, "ParentId": "0", "Attribute": "0",
+        "Id": id_hex, "ParentId": "0" if parent_id == "root" else format(int(parent_id), "X"),
+        "Attribute": str(attribute),
         "Timestamp": str(int(datetime.now().timestamp() * 1000)),
         "Lib_Type": "0", "CheckType": "0",
     })
@@ -227,3 +229,73 @@ def write_playlists(playlists: list[tuple[str, list[dict]]], append: bool = Fals
             _register_playlist_in_xml(r["playlist_id"])
     flush_wal()
     return results[::-1]
+
+
+def write_folder(folder: dict) -> dict:
+    """Create a folder tree at the top of the playlist tree, in one transaction
+    with one backup. `folder` is {"name", "children"}; each child is either a
+    folder of the same shape or a playlist {"name", "tracks"} (tracks.json
+    entries). Folders are DjmdPlaylist rows with Attribute=1; children point to
+    them via ParentID and are numbered Seq 1..n within their folder. Refuses if
+    the top level already has an item with the folder's name."""
+    from pyrekordbox.db6 import tables
+
+    if not os.environ.get("SET_CURATOR_RB_DIR") and is_rekordbox_running():
+        raise RuntimeError("Close Rekordbox first -- it overwrites master.db with its in-memory copy")
+
+    backup = backup_master_db()
+    db = open_db()
+    created, missing, added = [], [], 0
+    try:
+        if db.session.query(tables.DjmdPlaylist).filter_by(ParentID="root", Name=folder["name"]).first():
+            raise RuntimeError(f"'{folder['name']}' already exists at the top level -- delete it in Rekordbox first")
+        usn = {"playlist": _next_usn(db, tables.DjmdPlaylist), "song": _next_usn(db, tables.DjmdSongPlaylist)}
+
+        def make(node, parent_id, seq):
+            nonlocal added
+            row = tables.DjmdPlaylist()
+            row.ID = _new_id(db, tables.DjmdPlaylist, 1, 2**32 - 1)
+            row.Name = node["name"]
+            row.Seq = seq
+            row.Attribute = 1 if "children" in node else 0
+            row.ParentID = parent_id
+            _sync_fields(row, usn["playlist"])
+            usn["playlist"] += 1
+            db.session.add(row)
+            db.session.flush()
+            created.append((str(row.ID), parent_id, row.Attribute))
+            if "children" in node:
+                for n, child in enumerate(node["children"], 1):
+                    make(child, str(row.ID), n)
+                return
+            content_ids, unresolved = resolve_content_ids(db, node["tracks"])
+            missing.extend(unresolved)
+            for track_no, cid in enumerate(dict.fromkeys(content_ids), 1):
+                song = tables.DjmdSongPlaylist()
+                song.ID = _new_id(db, tables.DjmdSongPlaylist, 10**9, 10**10 - 1)
+                song.PlaylistID = row.ID
+                song.ContentID = cid
+                song.TrackNo = track_no
+                _sync_fields(song, usn["song"])
+                usn["song"] += 1
+                db.session.add(song)
+                added += 1
+
+        for pl in db.session.query(tables.DjmdPlaylist).filter_by(ParentID="root").all():
+            if pl.Seq is not None:
+                pl.Seq += 1
+        make(folder, "root", 0)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    finally:
+        db.session.close()
+        db.engine.dispose()
+
+    for playlist_id, parent_id, attribute in created:
+        _register_playlist_in_xml(playlist_id, parent_id, attribute)
+    flush_wal()
+    return {"folders": sum(1 for c in created if c[2] == 1),
+            "playlists": sum(1 for c in created if c[2] == 0),
+            "added": added, "missing": missing, "backup": str(backup)}

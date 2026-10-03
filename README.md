@@ -75,23 +75,40 @@ If the copy looks right, run without `SET_CURATOR_RB_DIR` (Rekordbox closed).
 ### Auto-grouping the whole library
 
 ```bash
-$PY cluster.py            # preview: every playlist with its tracks' BPMs
-$PY cluster.py --apply    # write them all into Rekordbox ("SC 01 ...", "SC 02 ...")
+$PY cluster.py            # preview the folder tree with every track's BPM
+$PY cluster.py --apply    # write it into Rekordbox
+```
+
+The result is a folder tree, which also carries over to USB exports:
+
+```
+SC/
+    Deep House/
+        110-118
+        119-127
+    Reggae Dub/
+        125-133
+        ...
+    Other tempos
 ```
 
 Tracks are first grouped by sound (k-means on the embeddings, `--size` tracks
-per group), then each group is split into tempo bands no wider than
+per group). Each group is named by a Discogs style from Essentia's
+`genre_discogs400` classifier: the style that sets the group apart from the
+rest of the library, distinct per group (approximate, since it runs on each
+track's averaged embedding). Each group is then split into tempo bands no wider than
 `--bpm-width` (default 8). Half/double time counts: within a group, a track's
 BPM is read as half, as-is or double, whichever is nearest the group's median,
 so an 80 in a 160 dub group sits with the 160s (marked `*` in the preview).
 Bands smaller than `--min` go to the closest-sounding band they fit tempo-wise;
 anything that fits nowhere ends up in "Other tempos".
 
-Each playlist is named after the existing Rekordbox playlist most specific to
-it plus its BPM range. Missing files, Rekordbox's built-in sampler sounds and
-duplicate copies of the same audio (the lossless copy is kept) are left out.
-All playlists are written in one transaction with one backup, so either all
-are created or none.
+Missing files, Rekordbox's built-in sampler sounds and duplicate copies of the
+same audio (the lossless copy is kept) are left out, as are tracks in any
+playlist passed with `--exclude-playlist "Name"` (repeatable). The whole tree is written
+in one transaction with one backup, so either all of it is created or none.
+`--apply` refuses if a top-level item named `SC` (`--folder`) already exists:
+delete the old folder in Rekordbox first, which removes everything inside it.
 
 ### Files on another machine
 
