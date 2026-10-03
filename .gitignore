@@ -1,0 +1,8 @@
+# personal library data
+tracks.json
+embeddings*.npz
+# downloaded by setup_essentia.sh
+models/
+__pycache__/
+.venv/
+.DS_Store
