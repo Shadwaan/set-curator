@@ -59,8 +59,17 @@ Only tracks already in that Rekordbox library can be added. Tracks are matched
 by exported ID when the file name agrees, else by unique file name, so a
 `tracks.json` from another machine still resolves; anything unmatched is listed.
 
-To try it against a copy: `SET_CURATOR_RB_DIR=/path/to/copy` (a folder holding
-`master.db` and `masterPlaylists6.xml`).
+Works on Windows and macOS (Rekordbox folder and process name are detected per
+platform). Tested on Windows so far; on a new machine, try it against a copy
+first -- `SET_CURATOR_RB_DIR` points everything at a folder holding `master.db`
+and `masterPlaylists6.xml`:
+
+```bash
+mkdir -p ~/rb-test && cp ~/Library/Pioneer/rekordbox/{master.db,masterPlaylists6.xml} ~/rb-test/
+SET_CURATOR_RB_DIR=~/rb-test $PY make_playlist.py "some track" --size 10 --name "SC Test" --apply
+```
+
+If the copy looks right, run without `SET_CURATOR_RB_DIR` (Rekordbox closed).
 
 ### Files on another machine
 
