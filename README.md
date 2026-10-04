@@ -18,6 +18,11 @@ things that write to Rekordbox are `make_playlist.py --apply` and
 | 3. Show nearest neighbours | `similar.py` | `numpy` |
 | 4. Build a playlist from weighted seeds, write it to Rekordbox | `make_playlist.py` + `rekordbox_write.py` | `pyrekordbox`, `psutil` |
 | 5. Auto-group the library into sound + tempo playlists, write them to Rekordbox | `cluster.py` + `rekordbox_write.py` | `scikit-learn`, `pyrekordbox`, `psutil` |
+| 6. Section-by-section "palette" analysis into `patches.npz` | `palette.py build` | Essentia |
+| 7. Cross-pollination: bridges, moods, palettes, relatives of your productions | `crosspollinate.py` | as 5 |
+| 8. Auto hot cues A/B/C on Rekordbox's beatgrid | `cues.py` | as 5 |
+| 9. Set roles (openers ... closers) and palette-coherent set arcs | `roles.py` (`--arcs`) | as 5, needs `cues.json` |
+| 10. Seed-based curation GUI: library + cosine.club, snippets, Spotify playlists | `curator_app.py` | `flask`, `requests`, `spotipy`, `python-dotenv`, `ffmpeg` |
 
 ## Setup (macOS)
 
@@ -28,6 +33,7 @@ on older macOS, pip falls back to an older wheel automatically.
 ./setup_essentia.sh          # venv at ~/.venvs/set-curator + model download
 PY=~/.venvs/set-curator/bin/python
 $PY -m pip install pyrekordbox psutil scikit-learn   # export, writing playlists, auto-grouping
+$PY -m pip install flask requests spotipy python-dotenv   # curator app
 ```
 
 ## Usage
@@ -107,8 +113,67 @@ Missing files, Rekordbox's built-in sampler sounds and duplicate copies of the
 same audio (the lossless copy is kept) are left out, as are tracks in any
 playlist passed with `--exclude-playlist "Name"` (repeatable). The whole tree is written
 in one transaction with one backup, so either all of it is created or none.
-`--apply` refuses if a top-level item named `SC` (`--folder`) already exists:
-delete the old folder in Rekordbox first, which removes everything inside it.
+`--apply` refuses if a top-level item named `SC` (`--folder`) already exists;
+add `--replace` to rebuild it in the same place. `--per-playlist` builds one
+folder per Rekordbox playlist instead, each split by sound and tempo.
+
+All Rekordbox writes (here and below) refuse while Rekordbox is running, back up
+`master.db` first, and are a single transaction.
+
+### Cross-pollination
+
+```bash
+$PY palette.py build                       # section-by-section analysis (~15 min)
+$PY crosspollinate.py --apply --replace    # SC / Cross-pollination
+```
+
+- **Bridges**: for each pair of your playlists that overlap, the tracks from
+  either that sound closest to the other; **Bridges (palette)** judges the same
+  by shared sounds.
+- **Moods**: the library by Essentia mood (Dark & Driving, Peak Time, ...).
+- **Palettes**: the library grouped by shared sound palette, named by mood and
+  the crates each group mostly comes from.
+- **Relatives**: each of your productions (files under `~/Documents/Samples`),
+  followed by the tracks sharing most of its palette.
+
+Every group is a folder of tempo playlists ("120-128", half-time folded), and
+copies of one song (separate files with the same audio) count once.
+
+### Hot cues
+
+```bash
+$PY cues.py            # detect -> cues.json
+$PY cues.py --apply    # write hot cues A/B/C into Rekordbox
+```
+
+A: the kick comes in. B: 8 bars before the first drop. C: the first drop at full
+energy. Positions come from Rekordbox's beatgrid and snap to 4/8-bar phrases.
+Tracks that already have cues are never touched; MP3s are skipped.
+
+### Set roles and set arcs
+
+```bash
+$PY roles.py --apply --replace          # SC / Set roles: 1 Openers ... 7 Closers
+$PY roles.py --arcs --apply --replace   # SC / Set arcs: roles inside each palette family
+```
+
+Roles are judged against tracks at a similar tempo, from peak loudness, drop
+size, melody (pitch clarity), rhythmic busyness, intro length and Essentia moods.
+Set arcs keep a role sequence inside each sound family (and tempo lane), so
+moving from role to role keeps the palette as well as the tempo.
+
+### Curator app
+
+```bash
+$PY curator_app.py     # http://127.0.0.1:8765
+```
+
+Seeds from your library or cosine.club, curate from your library (palette
+matching), the web (cosine.club candidates re-ranked across seeds) or both,
+preview snippets, keep tracks, save the set (`ledger.json`, `to_download.csv`)
+and optionally create it as a Spotify playlist. Needs a `.env` with
+`COSINE_API_KEY` (https://cosine.club/account/api) and `SPOTIFY_CLIENT_ID` (a
+Spotify dev app with redirect URI `http://127.0.0.1:8888/callback`).
 
 ### Files on another machine
 

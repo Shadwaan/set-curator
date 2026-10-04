@@ -6,3 +6,14 @@ models/
 __pycache__/
 .venv/
 .DS_Store
+# secrets and personal curation data
+.env
+.spotify_cache
+ledger.json
+to_download.csv
+backup-pre-reimport/
+patches.npz
+cues.json
+roles_features.json
+snapshots/
+.claude/

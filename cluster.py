@@ -40,6 +40,34 @@ def load(exclude_playlists=()):
     return tracks, [ids[n] for n in keep], vecs[keep]
 
 
+def merge_copies(tracks, ids, vecs):
+    """One entry per song. The library can hold a song as separate files -- e.g.
+    downloaded once per crate folder -- which Rekordbox treats as separate tracks.
+    Copies = same artist and title with audio >= 0.94, or audio >= 0.995 whatever
+    the name. Keeps one copy per song (lossless first, as load() orders them) and
+    gives it the playlists of all its copies, so a song filed in two crates counts
+    as being in both. Returns (ids, vecs, {dropped id: kept id}); `tracks` is
+    updated in memory only."""
+    import re
+    def key(t):
+        artist, title = t["artist"], t["title"]
+        if not artist and " - " in title:
+            artist, title = title.split(" - ", 1)
+        n = lambda x: re.sub(r"[^a-z0-9]+", " ", (x or "").lower()).strip()
+        return n(artist), n(title)
+    sims = vecs @ vecs.T
+    keep, merged = [], {}
+    for n, i in enumerate(ids):
+        twin = next((ids[k] for k in keep if sims[n, k] >= 0.995
+                     or (sims[n, k] >= 0.94 and key(tracks[i]) == key(tracks[ids[k]]))), None)
+        if twin is None:
+            keep.append(n)
+        else:
+            merged[i] = twin
+            tracks[twin] = {**tracks[twin], "playlists": sorted(set(tracks[twin]["playlists"]) | set(tracks[i]["playlists"]))}
+    return [ids[n] for n in keep], vecs[keep], merged
+
+
 def drop_duplicates(ids, vecs, threshold=0.999):
     sims = vecs @ vecs.T
     keep, dropped = [], []
@@ -125,58 +153,141 @@ def style_names(groups, probs, classes):
     return [pretty(classes[names[g]]) for g in range(len(groups))]
 
 
+def label_of(t):
+    return f"{t['artist']} - {t['title']}".strip(" -")
+
+
 def bpm_range(members, eff):
     lo, hi = round(min(eff[i] for i in members)), round(max(eff[i] for i in members))
     return f"{lo}-{hi}" if lo != hi else f"{lo}"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--size", type=int, default=50, help="target tracks per sound group, before the tempo split")
-    ap.add_argument("--bpm-width", type=float, default=8, help="max BPM spread within a playlist")
-    ap.add_argument("--min", type=int, default=5, help="smaller tempo bands go to a neighbouring playlist")
-    ap.add_argument("--exclude-playlist", action="append", default=[], metavar="NAME",
-                    help="leave out tracks in this Rekordbox playlist (repeatable)")
-    ap.add_argument("--folder", default="SC", help="name of the top-level Rekordbox folder")
-    ap.add_argument("--apply", action="store_true", help="write the folder tree into Rekordbox")
-    args = ap.parse_args()
-
-    tracks, ids, vecs = load(args.exclude_playlist)
-    ids, vecs, dropped = drop_duplicates(ids, vecs)
-    for i in dropped:
-        print(f"duplicate audio, skipped: {tracks[i]['path']}")
-
-    k = max(2, round(len(ids) / args.size))
-    labels = KMeans(n_clusters=k, n_init=20, random_state=0).fit_predict(vecs)
+def split_by_sound_and_tempo(ids, vecs, tracks, probs, classes, size, width, min_size):
+    """Group `ids` by sound, name each group by its style, split each into tempo
+    bands. Returns ([(style, [band of ids sorted by tempo]), ...], unplaced ids, eff BPMs)."""
+    k = max(1, round(len(ids) / size))
+    labels = KMeans(n_clusters=k, n_init=20, random_state=0).fit_predict(vecs) if k > 1 else np.zeros(len(ids), int)
     groups = [[ids[n] for n in np.flatnonzero(labels == c)] for c in range(k)]
-    classes, probs = style_predictions(ids)
     styles = style_names(groups, probs, classes)
 
     eff, bands, band_group, leftovers = {}, [], [], []
     for g, group in enumerate(groups):
         group_eff = mix_bpm(group, tracks)
         eff.update(group_eff)
-        for b in tempo_bands(group, group_eff, args.bpm_width):
-            if len(b) >= args.min:
+        for b in tempo_bands(group, group_eff, width):
+            if len(b) >= min_size:
                 bands.append(b)
                 band_group.append(g)
             else:
                 leftovers.extend(b)
     row = {i: n for n, i in enumerate(ids)}
-    unplaced = place_leftovers(leftovers, bands, eff, tracks, vecs, row, args.bpm_width)
-
-    folders = []
-    for g in sorted(range(k), key=lambda g: styles[g]):
-        playlists = sorted((sorted(b, key=eff.get) for b, bg in zip(bands, band_group) if bg == g),
-                           key=lambda b: eff[b[0]])
-        if playlists:
-            folders.append({"name": styles[g], "children": [
-                {"name": bpm_range(b, eff), "tracks": b} for b in playlists]})
-    tree = {"name": args.folder, "children": list(folders)}
-    if unplaced:
+    unplaced = place_leftovers(leftovers, bands, eff, tracks, vecs, row, width) if bands else leftovers
+    if bands and 0 < len(unplaced) < min_size:
+        # too few for an "Other tempos" playlist of their own: join the nearest tempo
+        # band, as long as that band stays within 1.5x the usual spread
+        still = []
         for i in unplaced:
-            eff[i] = tracks[i]["bpm"]
-        tree["children"].append({"name": "Other tempos", "tracks": sorted(unplaced, key=lambda i: tracks[i]["bpm"])})
+            bpm = tracks[i]["bpm"] or 0
+            fits = []
+            for b in bands:
+                lo, hi = min(eff[j] for j in b), max(eff[j] for j in b)
+                for x in (bpm / 2, bpm, bpm * 2):
+                    if bpm and max(hi, x) - min(lo, x) <= width * 1.5:
+                        fits.append((abs(x - (lo + hi) / 2), x, b))
+            if fits:
+                _, eff[i], band = min(fits, key=lambda f: f[0])
+                band.append(i)
+            else:
+                still.append(i)
+        unplaced = still
+    for i in unplaced:
+        eff[i] = tracks[i]["bpm"]
+
+    styled = []
+    for g in sorted(range(k), key=lambda g: styles[g]):
+        for b in sorted((sorted(b, key=eff.get) for b, bg in zip(bands, band_group) if bg == g),
+                        key=lambda b: eff[b[0]]):
+            styled.append((styles[g], b))
+    return styled, sorted(unplaced, key=lambda i: tracks[i]["bpm"]), eff
+
+
+def strong_matches(members, ids, vecs, tracks, threshold, limit=20):
+    """Tracks from other playlists that sound very close to any of `members`."""
+    row = {i: n for n, i in enumerate(ids)}
+    inside = set(members)
+    best = {}
+    for m in members:
+        sims = vecs @ vecs[row[m]]
+        for n in np.flatnonzero((sims >= threshold) & (sims < 0.999)):
+            other = ids[n]
+            if other not in inside and sims[n] > best.get(other, (0, None))[0]:
+                best[other] = (float(sims[n]), m)
+    return sorted(best.items(), key=lambda kv: -kv[1][0])[:limit]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--per-playlist", action="store_true",
+                    help="one folder per Rekordbox playlist, split inside by sound and tempo")
+    ap.add_argument("--size", type=int, help="target tracks per sound group before the tempo split "
+                                             "(default 50, or 25 with --per-playlist)")
+    ap.add_argument("--bpm-width", type=float, default=8, help="max BPM spread within a playlist")
+    ap.add_argument("--min", type=int, default=5, help="smaller tempo bands go to a neighbouring playlist")
+    ap.add_argument("--min-split", type=int, default=12,
+                    help="--per-playlist: smaller playlists stay whole, plus suggestions from other playlists")
+    ap.add_argument("--suggest-threshold", type=float, default=0.92,
+                    help="--per-playlist: similarity for a 'really strong' cross-playlist suggestion")
+    ap.add_argument("--exclude-playlist", action="append", default=[], metavar="NAME",
+                    help="leave out tracks in this Rekordbox playlist (repeatable)")
+    ap.add_argument("--folder", default="SC", help="name of the top-level Rekordbox folder")
+    ap.add_argument("--apply", action="store_true", help="write the folder tree into Rekordbox")
+    ap.add_argument("--replace", action="store_true", help="rebuild the folder if it already exists (same position)")
+    args = ap.parse_args()
+    size = args.size or (25 if args.per_playlist else 50)
+
+    tracks, ids, vecs = load(args.exclude_playlist)
+    classes, probs = style_predictions(ids)
+    eff = {i: tracks[i]["bpm"] for i in ids}
+    report = []
+
+    if args.per_playlist:
+        names = sorted({p for i in ids for p in tracks[i]["playlists"]} - set(args.exclude_playlist), key=str.lower)
+        folders = []
+        for name in names:
+            member_rows = [n for n, i in enumerate(ids) if name in tracks[i]["playlists"]]
+            p_ids, p_vecs, dropped = drop_duplicates([ids[n] for n in member_rows], vecs[member_rows])
+            for i in dropped:
+                print(f"{name}: duplicate audio, skipped: {tracks[i]['path']}")
+            if len(p_ids) < args.min_split:
+                children = [{"name": name, "tracks": sorted(p_ids, key=lambda i: tracks[i]["bpm"])}]
+                matches = strong_matches(p_ids, ids, vecs, tracks, args.suggest_threshold)
+                if matches:
+                    children.append({"name": "Suggested from other playlists", "tracks": [o for o, _ in matches]})
+                    for other, (sim, mine) in matches:
+                        report.append(f"{name}: {label_of(tracks[other])} ({', '.join(tracks[other]['playlists'])})"
+                                      f" ~ {label_of(tracks[mine])}  {sim:.2f}")
+            else:
+                styled, unplaced, p_eff = split_by_sound_and_tempo(
+                    p_ids, p_vecs, tracks, probs, classes, size, args.bpm_width, args.min)
+                children = [{"name": f"{style} {bpm_range(b, p_eff)}", "tracks": b, "eff": p_eff} for style, b in styled]
+                if unplaced:
+                    children.append({"name": "Other tempos", "tracks": unplaced})
+            folders.append({"name": name, "children": children})
+        tree = {"name": args.folder, "children": folders}
+    else:
+        ids, vecs, dropped = drop_duplicates(ids, vecs)
+        for i in dropped:
+            print(f"duplicate audio, skipped: {tracks[i]['path']}")
+        styled, unplaced, eff = split_by_sound_and_tempo(
+            ids, vecs, tracks, probs, classes, size, args.bpm_width, args.min)
+        folders = []
+        for style, b in styled:
+            if not folders or folders[-1]["name"] != style:
+                folders.append({"name": style, "children": []})
+            folders[-1]["children"].append({"name": bpm_range(b, eff), "tracks": b})
+        tree = {"name": args.folder, "children": list(folders)}
+        if unplaced:
+            tree["children"].append({"name": "Other tempos", "tracks": unplaced})
 
     def show(node, depth=0):
         pad = "    " * depth
@@ -185,16 +296,23 @@ def main():
             for child in node["children"]:
                 show(child, depth + 1)
             return
-        members = node["tracks"]
+        members, node_eff = node["tracks"], node.get("eff", eff)
         # BPM as Rekordbox shows it; * = counted as half/double time
-        bpms = " ".join(f"{tracks[i]['bpm']:.0f}{'*' if round(eff[i]) != round(tracks[i]['bpm']) else ''}"
+        bpms = " ".join(f"{tracks[i]['bpm']:.0f}{'*' if round(node_eff.get(i, 0)) != round(tracks[i]['bpm']) else ''}"
                         for i in members)
-        examples = ", ".join(f"{tracks[i]['artist']} - {tracks[i]['title']}".strip(" -")[:40] for i in members[:2])
+        examples = ", ".join(label_of(tracks[i])[:40] for i in members[:2])
         print(f"{pad}{node['name']}  ({len(members)})  {examples}\n{pad}    BPM: {bpms}")
 
-    n_playlists = sum(len(f["children"]) for f in folders) + bool(unplaced)
-    print(f"\n{len(ids)} tracks: {len(folders)} style folders, {n_playlists} playlists\n")
+    def count(node):
+        return (1, 0) if "tracks" in node else tuple(map(sum, zip((0, 1), *map(count, node["children"]))))
+
+    n_playlists, n_folders = count(tree)
+    print(f"\n{n_folders - 1} folders, {n_playlists} playlists\n")
     show(tree)
+    if report:
+        print("\nStrong matches from other playlists (suggestions):")
+        for line in report:
+            print("  " + line)
 
     if not args.apply:
         print("\nPreview only. Add --apply to write this folder into Rekordbox.")
@@ -207,7 +325,7 @@ def main():
             return {"name": node["name"], "children": [to_tracks(c) for c in node["children"]]}
         return {"name": node["name"], "tracks": [tracks[i] for i in node["tracks"]]}
 
-    result = write_folder(to_tracks(tree))
+    result = write_folder(to_tracks(tree), replace=args.replace)
     print(f"\nCreated '{args.folder}': {result['folders']} folders, {result['playlists']} playlists, "
           f"{result['added']} tracks. Backup: {result['backup']}")
     for t in result["missing"]:

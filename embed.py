@@ -56,12 +56,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="only process this many new tracks")
     ap.add_argument("--playlist", help="only tracks in this Rekordbox playlist")
+    ap.add_argument("--exclude-playlist", action="append", default=[], metavar="NAME",
+                    help="skip tracks that are only in this playlist (repeatable)")
     ap.add_argument("--path-map", action="append", default=[], metavar="OLD=NEW",
                     help="rewrite a path prefix, e.g. D:/Music=/Volumes/Music (repeatable)")
     args = ap.parse_args()
     path_map = [tuple(m.split("=", 1)) for m in args.path_map]
 
     tracks = json.loads((HERE / "tracks.json").read_text(encoding="utf-8"))
+    # Rekordbox's bundled sampler sounds and demo tracks aren't music to curate
+    tracks = [t for t in tracks if not re.search(r"/rekordbox/Sampler/|/PioneerDJ/Demo Tracks/", t["path"])]
+    if args.exclude_playlist:
+        tracks = [t for t in tracks if not t["playlists"] or set(t["playlists"]) - set(args.exclude_playlist)]
     if args.playlist:
         tracks = [t for t in tracks if args.playlist in t["playlists"]]
 

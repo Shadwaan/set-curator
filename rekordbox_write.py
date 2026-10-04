@@ -114,6 +114,34 @@ def _register_playlist_in_xml(playlist_id: str, parent_id: str = "root", attribu
     tree.write(xml_path, encoding="UTF-8", xml_declaration=True)
 
 
+def _delete_subtree(db, root_id: str) -> list[str]:
+    """Delete a playlist/folder and everything inside it (playlist rows and their
+    track entries; the tracks themselves stay in the collection)."""
+    from pyrekordbox.db6 import tables
+    gone, stack = [], [root_id]
+    while stack:
+        pid = stack.pop()
+        stack += [str(p.ID) for p in db.session.query(tables.DjmdPlaylist).filter_by(ParentID=pid)]
+        db.session.query(tables.DjmdSongPlaylist).filter_by(PlaylistID=pid).delete(synchronize_session=False)
+        gone.append(pid)
+    db.session.query(tables.DjmdPlaylist).filter(tables.DjmdPlaylist.ID.in_(gone)).delete(synchronize_session=False)
+    db.session.flush()
+    return gone
+
+
+def _unregister_playlists_in_xml(playlist_ids: list[str]):
+    xml_path = rekordbox_dir() / "masterPlaylists6.xml"
+    if not playlist_ids or not xml_path.exists():
+        return
+    tree = ET.parse(xml_path)
+    playlists = tree.getroot().find("PLAYLISTS")
+    hexes = {format(int(i), "X") for i in playlist_ids}
+    for node in list(playlists.findall("NODE")):
+        if node.get("Id") in hexes:
+            playlists.remove(node)
+    tree.write(xml_path, encoding="UTF-8", xml_declaration=True)
+
+
 def flush_wal():
     from sqlalchemy import text
     for _ in range(2):
@@ -231,13 +259,16 @@ def write_playlists(playlists: list[tuple[str, list[dict]]], append: bool = Fals
     return results[::-1]
 
 
-def write_folder(folder: dict) -> dict:
-    """Create a folder tree at the top of the playlist tree, in one transaction
+def write_folder(folder: dict, parent: str | None = None, replace: bool = False) -> dict:
+    """Create a folder tree at the top of the playlist tree -- or, with `parent`
+    ("SC" or a path like "SC/Cross-pollination"), as the last item inside that
+    existing folder -- in one transaction
     with one backup. `folder` is {"name", "children"}; each child is either a
     folder of the same shape or a playlist {"name", "tracks"} (tracks.json
     entries). Folders are DjmdPlaylist rows with Attribute=1; children point to
-    them via ParentID and are numbered Seq 1..n within their folder. Refuses if
-    the top level already has an item with the folder's name."""
+    them via ParentID and are numbered Seq 1..n within their folder. If the
+    destination already has an item with the folder's name: refuse, or with
+    replace=True delete it (and everything inside) and put the new tree in its place."""
     from pyrekordbox.db6 import tables
 
     if not os.environ.get("SET_CURATOR_RB_DIR") and is_rekordbox_running():
@@ -245,10 +276,21 @@ def write_folder(folder: dict) -> dict:
 
     backup = backup_master_db()
     db = open_db()
-    created, missing, added = [], [], 0
+    created, missing, added, removed = [], [], 0, []
     try:
-        if db.session.query(tables.DjmdPlaylist).filter_by(ParentID="root", Name=folder["name"]).first():
-            raise RuntimeError(f"'{folder['name']}' already exists at the top level -- delete it in Rekordbox first")
+        parent_id = "root"
+        for part in (parent.split("/") if parent else []):  # e.g. "SC/Cross-pollination"
+            host = db.session.query(tables.DjmdPlaylist).filter_by(ParentID=parent_id, Name=part, Attribute=1).first()
+            if host is None:
+                raise RuntimeError(f"No folder '{part}' in '{parent}'")
+            parent_id = str(host.ID)
+        seq = None
+        existing = db.session.query(tables.DjmdPlaylist).filter_by(ParentID=parent_id, Name=folder["name"]).first()
+        if existing:
+            if not replace:
+                raise RuntimeError(f"'{folder['name']}' already exists there -- use replace to rebuild it")
+            seq = existing.Seq
+            removed = _delete_subtree(db, str(existing.ID))
         usn = {"playlist": _next_usn(db, tables.DjmdPlaylist), "song": _next_usn(db, tables.DjmdSongPlaylist)}
 
         def make(node, parent_id, seq):
@@ -281,10 +323,15 @@ def write_folder(folder: dict) -> dict:
                 db.session.add(song)
                 added += 1
 
-        for pl in db.session.query(tables.DjmdPlaylist).filter_by(ParentID="root").all():
-            if pl.Seq is not None:
-                pl.Seq += 1
-        make(folder, "root", 0)
+        if seq is not None:
+            make(folder, parent_id, seq)  # replacing: same position
+        elif parent_id == "root":
+            for pl in db.session.query(tables.DjmdPlaylist).filter_by(ParentID="root").all():
+                if pl.Seq is not None:
+                    pl.Seq += 1
+            make(folder, "root", 0)
+        else:
+            make(folder, parent_id, db.session.query(tables.DjmdPlaylist).filter_by(ParentID=parent_id).count() + 1)
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -293,9 +340,82 @@ def write_folder(folder: dict) -> dict:
         db.session.close()
         db.engine.dispose()
 
+    _unregister_playlists_in_xml(removed)
     for playlist_id, parent_id, attribute in created:
         _register_playlist_in_xml(playlist_id, parent_id, attribute)
     flush_wal()
     return {"folders": sum(1 for c in created if c[2] == 1),
             "playlists": sum(1 for c in created if c[2] == 0),
-            "added": added, "missing": missing, "backup": str(backup)}
+            "added": added, "missing": missing, "removed": len(removed), "backup": str(backup)}
+
+
+def write_hot_cues(cues: dict[str, dict[str, float]]) -> dict:
+    """Hot cues A/B/C for tracks that have no cues yet, in one transaction with
+    one backup. `cues` maps a track ID to {"A": seconds, "B": ..., "C": ...}.
+
+    Stored the way Rekordbox 7 stores them (copied from cues set in Rekordbox):
+    one djmdCue row per cue (Kind 1/2/3 = A/B/C, InFrame in 1/150 s, no colour,
+    rb_local_usn None) plus one contentCue row per track, keyed by the track's
+    UUID, whose Cues column repeats the rows as JSON. The analysis files' cue
+    tags stay empty, as Rekordbox leaves them locally. Tracks with any existing
+    cue are never touched; MP3s are skipped (their cues also carry MPEG frame
+    offsets we have no example of)."""
+    import json
+    from pyrekordbox.db6 import tables
+
+    if not os.environ.get("SET_CURATOR_RB_DIR") and is_rekordbox_running():
+        raise RuntimeError("Close Rekordbox first -- it overwrites master.db with its in-memory copy")
+
+    backup = backup_master_db()
+    db = open_db()
+    written, skipped = 0, {"already has cues": 0, "mp3": 0, "not in library": 0}
+    stamp = lambda t: t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}+00:00"
+    try:
+        has = {str(r[0]) for r in db.session.query(tables.DjmdCue.ContentID)} | \
+              {str(r[0]) for r in db.session.query(tables.ContentCue.ContentID)}
+        usn = _next_usn(db, tables.ContentCue)
+        for cid, points in cues.items():
+            content = db.session.query(tables.DjmdContent).filter_by(ID=cid).first()
+            if content is None:
+                skipped["not in library"] += 1
+                continue
+            if cid in has:
+                skipped["already has cues"] += 1
+                continue
+            if content.FileType == 1:
+                skipped["mp3"] += 1
+                continue
+            now = datetime.now(timezone.utc)
+            entries = []
+            for kind, key in ((1, "A"), (2, "B"), (3, "C")):
+                ms = int(round(points[key] * 1000))
+                row = tables.DjmdCue(
+                    ID=_new_id(db, tables.DjmdCue, 1, 2**32 - 1), ContentID=cid,
+                    InMsec=ms, InFrame=ms * 150 // 1000, InMpegFrame=0, InMpegAbs=0,
+                    OutMsec=-1, OutFrame=0, OutMpegFrame=0, OutMpegAbs=0,
+                    Kind=kind, Color=-1, ContentUUID=content.UUID, UUID=str(uuid.uuid4()),
+                    rb_data_status=0, rb_local_data_status=0, rb_local_deleted=0, rb_local_synced=0,
+                    usn=None, rb_local_usn=None, created_at=now, updated_at=now)
+                db.session.add(row)
+                entries.append({"ID": row.ID, "ContentID": cid, "ContentUUID": content.UUID,
+                                "InMsec": row.InMsec, "InFrame": row.InFrame, "InMpegFrame": 0, "InMpegAbs": 0,
+                                "OutMsec": -1, "OutFrame": 0, "OutMpegFrame": 0, "OutMpegAbs": 0,
+                                "Kind": kind, "Color": -1, "UUID": row.UUID,
+                                "created_at": stamp(now), "updated_at": stamp(now)})
+            db.session.add(tables.ContentCue(
+                ID=content.UUID, ContentID=cid, Cues=json.dumps(entries, ensure_ascii=False, separators=(",", ":")),
+                rb_cue_count=len(entries), UUID=str(uuid.uuid4()),
+                rb_data_status=0, rb_local_data_status=0, rb_local_deleted=0, rb_local_synced=0,
+                usn=None, rb_local_usn=usn, created_at=now, updated_at=now))
+            usn += 1
+            db.session.flush()
+            written += 1
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    finally:
+        db.session.close()
+        db.engine.dispose()
+    flush_wal()
+    return {"written": written, "skipped": skipped, "backup": str(backup)}
