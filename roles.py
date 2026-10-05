@@ -87,6 +87,22 @@ def audio_features(tracks, ids, cue_data) -> dict[str, dict]:
         if n % 25 == 0:
             print(f"features {n}/{len(todo)}", flush=True)
             FEATURES.write_text(json.dumps(feats))
+    need = [i for i in ids if i in feats and "bass" not in feats[i]]
+    if need:
+        found = cues.analysis_paths_from_files({i: tracks[i] for i in need})
+        for n, i in enumerate(need, 1):
+            if i not in found:
+                feats[i]["bass"] = None          # no analysis file to read the beatgrid from; filled with the median later
+                continue
+            bars = cues.downbeats(found[i])
+            e = cues.bar_energy(tracks[i]["path"], bars)
+            c = cue_data[i]["bars"]["C"]; sl = slice(c, c + 8)
+            full = 10 * np.log10(sum(10 ** (e[b][sl] / 10) for b in cues.BANDS).mean())
+            low = 10 * np.log10((10 ** (e["low"][sl] / 10)).mean())
+            feats[i]["bass"] = [float(low), float(low - full)]   # bass level, bass share of the full mix (dB)
+            if n % 50 == 0:
+                print(f"bass {n}/{len(need)}", flush=True)
+                FEATURES.write_text(json.dumps(feats))
     for n, i in enumerate([i for i in ids if i in feats and "busy" not in feats[i]], 1):
         feats[i]["busy"] = busyness(tracks[i]["path"], cue_data[i]["C"])
         if n % 50 == 0:
@@ -147,11 +163,17 @@ def assign(ids, feats, models, bpms, playlists=None) -> dict[str, list[str]]:
     z = lambda v: z_in_lane(v, bpms)
     f = {k: z([feats[i][k] for i in ids]) for k in ("peak_level", "contrast", "steady", "intro", "melody", "busy")}
     m = {k: z(v) for k, v in models.items()}
-    energy = (0.5 * f["peak_level"] + m["party"] + f["busy"]) / 2.5
+    # bass strength: level and share of the full mix at the peak (a strong bassline is energy
+    # even when the rhythm is sparse); tracks with no reading get the library median
+    got = [feats[i].get("bass") for i in ids]
+    med = np.nanmedian(np.array([b for b in got if b], dtype=float), axis=0) if any(got) else np.zeros(2)
+    bass = np.array([b if b else med for b in got], dtype=float)
+    f["bass"] = (z(bass[:, 0]) + z(bass[:, 1])) / 2
+    energy = (0.5 * f["peak_level"] + m["party"] + f["busy"] + 0.8 * f["bass"]) / 3.3
     scores = np.stack([
         -energy + m["relaxed"] + f["intro"] - f["contrast"],                    # openers: gentle, long intro
-        f["steady"] - np.abs(energy) + 0.5 * m["party"] - 0.5 * f["contrast"] - 0.5 * f["busy"],  # warmers: gentle groove
-        1.5 * f["busy"] + 0.5 * f["steady"] + 0.5 * m["relaxed"] - f["contrast"] - 0.5 * f["peak_level"],
+        f["steady"] - 0.8 * energy + 0.3 * m["party"] - 0.5 * f["contrast"] - 0.3 * f["busy"],    # warmers: gentle groove, below average energy
+        1.5 * f["busy"] + 0.5 * f["steady"] + 0.3 * m["relaxed"] + 0.8 * energy - f["contrast"] - 1.2 * np.maximum(0, -energy),
                                                                                  # momentum builders: busy, laid back, no peak
         m["happy"] + m["voice"] + m["party"],                                   # crowd attractors: bright hooks
         energy + 0.7 * f["contrast"] + 0.5 * m["aggressive"] + 0.5 * f["busy"] - 0.5 * m["relaxed"],
