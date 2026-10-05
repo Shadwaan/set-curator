@@ -40,6 +40,30 @@ def analysis_paths() -> dict[str, str]:
     return out
 
 
+def analysis_paths_from_files(tracks: dict) -> dict[str, str]:
+    """Track ID -> .DAT analysis file, found by the file name stored inside each
+    analysis file (it keeps only "?/<file name>"), so no database access is needed
+    and it is safe while Rekordbox is open. File names shared by several tracks or
+    analysis files are skipped rather than guessed."""
+    import unicodedata
+    from collections import Counter
+    from pyrekordbox import anlz
+    norm = lambda x: unicodedata.normalize("NFC", str(x)).strip("\x00 ").split("/")[-1].lower()
+    found = []
+    for p in (RB_SHARE / "PIONEER" / "USBANLZ").rglob("ANLZ0000.DAT"):
+        try:
+            name = norm(anlz.AnlzFile.parse_file(p).get_tag("PPTH").get())
+        except Exception:
+            continue
+        if name:
+            found.append((name, "/" + str(p.relative_to(RB_SHARE))))
+    counts = Counter(name for name, _ in found)
+    by_name = {name: path for name, path in found if counts[name] == 1}
+    track_names = Counter(norm(t["path"]) for t in tracks.values())
+    return {i: by_name[norm(t["path"])] for i, t in tracks.items()
+            if track_names[norm(t["path"])] == 1 and norm(t["path"]) in by_name}
+
+
 def downbeats(dat_path: str) -> np.ndarray:
     from pyrekordbox import anlz
     beats, _, times = anlz.AnlzFile.parse_file(RB_SHARE / dat_path.lstrip("/")).get_tag("PQTZ").get()
@@ -47,7 +71,9 @@ def downbeats(dat_path: str) -> np.ndarray:
 
 
 def bar_energy(path: str, bars: np.ndarray) -> dict[str, np.ndarray]:
-    """Mean power per bar in each band, in dB."""
+    """Mean power per bar in each band, in dB, plus "low_body": the bar's median
+    low-end level, which stays low when the low end is only a few hits (a thump
+    without bass) and rises when kick and bass sustain it."""
     from essentia.standard import MonoLoader
     audio = MonoLoader(filename=path, sampleRate=SR)()
     hop, size = 512, 2048
@@ -63,6 +89,9 @@ def bar_energy(path: str, bars: np.ndarray) -> dict[str, np.ndarray]:
         band = power[:, (freqs >= lo) & (freqs < hi)].sum(axis=1)
         per_bar = [band[a:b].mean() if b > a else 0.0 for a, b in zip(idx[:-1], idx[1:])]
         out[name] = 10 * np.log10(np.maximum(per_bar, 1e-10))
+        if name == "low":
+            db = 10 * np.log10(np.maximum(band, 1e-10))
+            out["low_body"] = np.array([np.median(db[a:b]) if b > a else -100.0 for a, b in zip(idx[:-1], idx[1:])])
     return out
 
 
@@ -83,7 +112,12 @@ def detect(bars: np.ndarray, energy: dict[str, np.ndarray]) -> dict:
     after = lambda k: level[k:k + 8].mean()
     late = int(n * 0.9)
 
-    a = snap(next((i for i in range(n - 8) if kick[i:i + 8].sum() >= 6), 0), 0, n)
+    # A: the bar the kick actually comes in (it must stay in for the next 8 bars), not the
+    # first bar whose following window happens to contain it
+    entry = next((i for i in range(n - 8) if kick[i] and kick[i:i + 8].sum() >= 6), 0)
+    near = round(entry / 4) * 4
+    a = near if 0 <= near - entry <= 1 or entry - near == 1 else entry   # tidy to a 4-bar line only when 1 bar off
+    a = min(max(a, 0), n - 1)
 
     # drops: the kick coming back after a break of 4+ bars
     drops, i = [], a + 4
@@ -122,8 +156,16 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--match", help="only tracks whose artist/title contains this")
     ap.add_argument("--apply", action="store_true", help="write the cues in cues.json into Rekordbox")
+    ap.add_argument("--update", metavar="FILE", help="replace cues this tool wrote earlier (FILE holds the positions "
+                    "it wrote, e.g. cues_v1.json) with the ones in cues.json; cues you changed are left alone")
     args = ap.parse_args()
 
+    if args.update:
+        from rekordbox_write import update_hot_cues
+        previous = HERE / args.update
+        result = update_hot_cues(json.loads(OUT.read_text()), json.loads(previous.read_text()))
+        print(f"Cues updated on {result['updated']} tracks; left alone: {result['skipped']}. Backup: {result['backup']}")
+        return
     if args.apply:
         from rekordbox_write import write_hot_cues
         result = write_hot_cues(json.loads(OUT.read_text()))
@@ -134,7 +176,7 @@ def main():
     if args.match:
         ids = [i for i in ids if args.match.lower() in cluster.label_of(tracks[i]).lower()]
     ids = ids[: args.limit] if args.limit else ids
-    paths = analysis_paths()
+    paths = analysis_paths_from_files({i: tracks[i] for i in ids})
     out = json.loads(OUT.read_text()) if OUT.exists() else {}
     for n, i in enumerate(ids, 1):
         if i not in paths:

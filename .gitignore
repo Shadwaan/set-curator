@@ -17,3 +17,9 @@ cues.json
 roles_features.json
 snapshots/
 .claude/
+cues_v1.json
+corrections/
+playlist_leans.json
+cues_v2.json
+cues_v3.json
+crate_data*.json

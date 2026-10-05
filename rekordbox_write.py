@@ -419,3 +419,51 @@ def write_hot_cues(cues: dict[str, dict[str, float]]) -> dict:
         db.engine.dispose()
     flush_wal()
     return {"written": written, "skipped": skipped, "backup": str(backup)}
+
+
+def update_hot_cues(new: dict[str, dict[str, float]], written: dict[str, dict[str, float]]) -> dict:
+    """Replace hot cues A/B/C that this tool wrote earlier with better positions.
+    `written` maps a track ID to the positions (seconds) it was given before. A track is
+    only touched when its cue rows are still exactly those three -- anything you moved,
+    added or deleted in Rekordbox since is left alone. One transaction, one backup."""
+    from sqlalchemy import text
+    from pyrekordbox.db6 import tables
+
+    if not os.environ.get("SET_CURATOR_RB_DIR") and is_rekordbox_running():
+        raise RuntimeError("Close Rekordbox first -- it overwrites master.db with its in-memory copy")
+
+    backup = backup_master_db()
+    db = open_db()
+    updated, skipped = 0, {"edited since": 0, "unchanged": 0, "not in library": 0}
+    todo = []
+    try:
+        for cid, points in new.items():
+            old = written.get(cid)
+            if old is None:
+                continue
+            rows = db.session.query(tables.DjmdCue).filter_by(ContentID=cid).order_by(tables.DjmdCue.Kind).all()
+            if not rows and db.session.query(tables.DjmdContent).filter_by(ID=cid).first() is None:
+                skipped["not in library"] += 1
+                continue
+            same = [(r.Kind, r.InMsec) for r in rows] == [(k, int(round(old[x] * 1000))) for k, x in ((1, "A"), (2, "B"), (3, "C"))]
+            if not same:
+                skipped["edited since"] += 1
+                continue
+            if all(int(round(points[x] * 1000)) == int(round(old[x] * 1000)) for x in "ABC"):
+                skipped["unchanged"] += 1
+                continue
+            todo.append(cid)
+        for cid in todo:
+            db.session.query(tables.DjmdCue).filter_by(ContentID=cid).delete(synchronize_session=False)
+            db.session.query(tables.ContentCue).filter_by(ContentID=cid).delete(synchronize_session=False)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    finally:
+        db.session.close()
+        db.engine.dispose()
+    # old rows are gone; write_hot_cues writes the new ones for exactly those tracks
+    result = write_hot_cues({cid: new[cid] for cid in todo}) if todo else {"written": 0}
+    updated = result["written"]
+    return {"updated": updated, "skipped": skipped, "backup": str(backup)}

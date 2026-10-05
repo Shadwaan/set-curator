@@ -9,8 +9,7 @@ whose playlists are just its tempo bands ("120-128"):
                       threshold set to let through the same share of tracks
   Moods/              the whole library by Essentia mood (Dark & Driving, Peak Time,
                       Laid-back, ...)
-  Palettes/           the whole library grouped by shared sound palette, each group
-                      named by its strongest mood and the crates it mostly comes from
+  (Mood palettes were merged into Set arcs, see roles.py --arcs)
   Relatives/          for each of your productions (under ~/Documents/Samples): the
                       production itself, then the 20 tracks sharing most of its
                       sound palette, closest first
@@ -39,11 +38,18 @@ def short(playlist: str) -> str:
     return playlist[:-5] if playlist.endswith(" AIFF") else playlist
 
 
-def tempo_folder(name, members, tracks, width, min_size):
-    """{"name": name, "children": tempo playlists named just "120-128"}, or None if no band is big enough."""
+def tempo_folder(name, members, tracks, width, min_size, keep_rest=False):
+    """{"name": name, "children": tempo playlists named just "120-128"}, or None if no
+    band is big enough. With keep_rest, songs in bands that are too small go to an
+    "Other tempos" playlist instead of being left out."""
     eff = mix_bpm(members, tracks)
     bands = [{"name": bpm_range(b, eff), "tracks": b, "eff": eff}
              for b in tempo_bands(members, eff, width) if len(b) >= min_size]
+    if keep_rest:
+        placed = {i for b in bands for i in b["tracks"]}
+        rest = sorted((i for i in members if i not in placed), key=lambda i: tracks[i]["bpm"])
+        if rest:
+            bands.append({"name": "Other tempos", "tracks": rest})
     return {"name": name, "children": bands} if bands else None
 
 
@@ -126,11 +132,12 @@ def moods(tracks, ids, z, width, min_z=0.5):
     return out
 
 
-def palette_groups(tracks, ids, sims, z, size=40) -> list[tuple[str, list[str]]]:
+def palette_families(tracks, ids, sims, z, size=40) -> list[dict]:
     """The whole library grouped by shared sound palette (spectral clustering on
     palette similarity; groups over 2x `size` are split again), largest first.
-    Each group is named by its strongest mood plus the crates most of its tracks
-    come from; groups that would share a name get their Discogs style added."""
+    Each family: {"mood": its strongest mood, "crate": the one playlist of yours most
+    of its songs come from, "style": its Discogs style (distinct per family),
+    "members": [ids]}."""
     from sklearn.cluster import SpectralClustering
     sims = (sims + sims.T) / 2
     lo, hi = np.percentile(sims, 5), np.percentile(sims, 99.5)
@@ -156,27 +163,49 @@ def palette_groups(tracks, ids, sims, z, size=40) -> list[tuple[str, list[str]]]
     groups.sort(key=len, reverse=True)
     classes, probs = cluster.style_predictions(ids)
     styles = cluster.style_names([[ids[r] for r in g] for g in groups], probs, classes)
-    names = []
-    for g in groups:
-        mood = list(MOODS.values())[int(z[g].mean(axis=0).argmax())]
+    families = []
+    for n, g in enumerate(groups):
         counts = {}
         for r in g:
             for c in tracks[ids[r]]["playlists"]:
                 counts[c] = counts.get(c, 0) + 1
-        crates = sorted(counts, key=lambda c: -counts[c] ** 2 / crate_sizes[c])
-        top = [c for c in crates[:2] if counts[c] >= 0.25 * len(g)] or crates[:1]
-        names.append(f"{mood} · {' × '.join(short(c) for c in top)}" if top else mood)
-    return [(names[n] if names.count(names[n]) == 1 else f"{names[n]} ({styles[n]})", [ids[r] for r in g])
-            for n, g in enumerate(groups)]
+        # the playlist most specific to this family, among those holding a real share of it
+        # (a tiny playlist that happens to fit entirely shouldn't name a big family)
+        big = [c for c in counts if counts[c] >= 0.25 * len(g)] or list(counts)
+        crate = max(big, key=lambda c: counts[c] ** 2 / crate_sizes[c]) if big else None
+        families.append({"mood": list(MOODS.values())[int(z[g].mean(axis=0).argmax())],
+                         "crate": short(crate) if crate else "No playlist", "style": styles[n],
+                         "members": [ids[r] for r in g]})
+    return families
+
+
+def mood_tree(families, leaf) -> list[dict]:
+    """Mood > your playlist > [style] > whatever `leaf(name, family)` builds. The
+    style level only appears where one playlist has several families under one mood
+    (so Laid-back > Dub Reggae Bass Addict > Reggae, Electronic Dub). Names never
+    combine two playlists."""
+    by_mood = {}
+    for f in families:
+        by_mood.setdefault(f["mood"], {}).setdefault(f["crate"], []).append(f)
+    out = []
+    for mood in MOODS.values():
+        crates = []
+        for crate, fams in sorted(by_mood.get(mood, {}).items(), key=lambda kv: -sum(len(f["members"]) for f in kv[1])):
+            if len(fams) == 1:
+                node = leaf(crate, fams[0])
+            else:
+                kids = [k for k in (leaf(f["style"], f) for f in fams) if k]
+                node = {"name": crate, "children": kids} if kids else None
+            if node:
+                crates.append(node)
+        if crates:
+            out.append({"name": mood, "children": crates})
+    return out
 
 
 def palettes(tracks, ids, sims, z, width):
-    out = []
-    for name, members in palette_groups(tracks, ids, sims, z):
-        folder = tempo_folder(name, members, tracks, width, 4)
-        if folder:
-            out.append(folder)
-    return out
+    families = palette_families(tracks, ids, sims, z)
+    return mood_tree(families, lambda name, f: tempo_folder(name, f["members"], tracks, width, 4, keep_rest=True))
 
 
 def relatives(tracks, ids, vecs, n=20):
@@ -220,7 +249,6 @@ def main():
         {"name": "Bridges (palette)", "children": bridges(tracks, ids, vecs, args.bridge_threshold, args.bpm_width,
                                                           "palette")},
         {"name": "Moods", "children": moods(tracks, ids, z, args.bpm_width)},
-        {"name": "Palettes", "children": palettes(tracks, ids, palette_matrix(ids), z, args.bpm_width)},
         {"name": "Relatives", "children": relatives(tracks, ids, vecs)},
     ]}
 

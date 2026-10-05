@@ -29,8 +29,8 @@ from cluster import HERE, label_of
 from crosspollinate import tempo_folder
 
 FEATURES = HERE / "roles_features.json"
-ROLES = ["1 Openers", "2 Warmers", "3 Momentum builders", "4 Crowd attractors", "5 Sustainers", "6 Moments",
-         "7 Closers"]
+ROLES = ["1 Openers", "2 Warmers", "3 Momentum builders", "4 Crowd attractors", "5 Peak time", "6 Sustainers",
+         "7 Moments", "8 Closers"]
 
 
 def pitch_clarity(path: str, start: float, end: float) -> float:
@@ -59,6 +59,16 @@ def busyness(path: str, start: float) -> float:
 
 def audio_features(tracks, ids, cue_data) -> dict[str, dict]:
     feats = json.loads(FEATURES.read_text()) if FEATURES.exists() else {}
+    # measurements taken at a track's peak section (cue C) are redone when C has moved
+    previous = HERE / "cues_v1.json"
+    legacy_c = {k: v["bars"]["C"] for k, v in json.loads(previous.read_text()).items()} if previous.exists() else {}
+    for i in ids:
+        if i in feats and i in cue_data:
+            if feats[i].get("c", legacy_c.get(i)) != cue_data[i]["bars"]["C"]:
+                del feats[i]
+            else:
+                feats[i]["c"] = cue_data[i]["bars"]["C"]
+                feats[i]["intro"] = cue_data[i]["bars"]["A"]
     todo = [i for i in ids if i in cue_data and i not in feats]
     paths = cues.analysis_paths() if todo else {}
     for n, i in enumerate(todo, 1):
@@ -69,7 +79,7 @@ def audio_features(tracks, ids, cue_data) -> dict[str, dict]:
         kick = low >= np.percentile(low, 90) - 8
         a, c = cue_data[i]["bars"]["A"], cue_data[i]["bars"]["C"]
         peak_end = bars[min(c + 16, len(bars) - 1)] if c + 16 < len(bars) else tracks[i]["length"]
-        feats[i] = {"peak_level": float(level[c:c + 8].mean()),
+        feats[i] = {"c": int(c), "peak_level": float(level[c:c + 8].mean()),
                     "contrast": float(level[c:c + 8].mean() - level[max(0, c - 8):c].mean()) if c else 0.0,
                     "steady": float(kick.mean()), "intro": int(a),
                     "melody": pitch_clarity(tracks[i]["path"], float(bars[c]), float(peak_end)),
@@ -93,7 +103,7 @@ def model_scores(ids) -> dict[str, np.ndarray]:
     x = np.stack([raw[i] for i in ids]).astype(np.float32)
     out = {}
     for model, positive in (("voice_instrumental", "voice"), ("mood_party", "party"), ("mood_relaxed", "relaxed"),
-                            ("mood_happy", "happy"), ("mood_sad", "sad")):
+                            ("mood_happy", "happy"), ("mood_sad", "sad"), ("mood_aggressive", "aggressive")):
         meta = json.loads((HERE / "models" / f"{model}-discogs-effnet-1.json").read_text())
         head = TensorflowPredict2D(graphFilename=str(HERE / "models" / f"{model}-discogs-effnet-1.pb"),
                                    input="model/Placeholder", output="model/Softmax")
@@ -124,7 +134,16 @@ def z_in_lane(x, bpms, width=6.0) -> np.ndarray:
     return out
 
 
-def assign(ids, feats, models, bpms) -> dict[str, list[str]]:
+# Optional nudges from your own knowledge of your playlists, in playlist_leans.json:
+#   {"My Warm-up Crate": [["1 Openers", 0.3], ["2 Warmers", 0.4]], ...}
+# Each entry pushes songs in that playlist towards those roles. Scores are in units of one
+# standard deviation, so these only nudge: the audio evidence still decides when it disagrees.
+LEANS_FILE = HERE / "playlist_leans.json"
+LEANS = {k: [tuple(x) for x in v] for k, v in json.loads(LEANS_FILE.read_text(encoding="utf-8")).items()} \
+    if LEANS_FILE.exists() else {}
+
+
+def assign(ids, feats, models, bpms, playlists=None) -> dict[str, list[str]]:
     z = lambda v: z_in_lane(v, bpms)
     f = {k: z([feats[i][k] for i in ids]) for k in ("peak_level", "contrast", "steady", "intro", "melody", "busy")}
     m = {k: z(v) for k, v in models.items()}
@@ -135,16 +154,56 @@ def assign(ids, feats, models, bpms) -> dict[str, list[str]]:
         1.5 * f["busy"] + 0.5 * f["steady"] + 0.5 * m["relaxed"] - f["contrast"] - 0.5 * f["peak_level"],
                                                                                  # momentum builders: busy, laid back, no peak
         m["happy"] + m["voice"] + m["party"],                                   # crowd attractors: bright hooks
-        f["steady"] + energy - f["melody"] - m["voice"] - f["contrast"],        # sustainers: functional, driving
+        energy + 0.7 * f["contrast"] + 0.5 * m["aggressive"] + 0.5 * f["busy"] - 0.5 * m["relaxed"],
+                                                                                 # peak time: top energy, hard drop, driving
+        f["steady"] + 1.2 * energy + 0.5 * f["busy"] - 0.5 * f["melody"] - 0.3 * m["voice"] - f["contrast"],        # sustainers: functional, driving
         2.5 * f["melody"] + f["contrast"] + 0.5 * energy,                       # moments: powerful melody first
         m["sad"] + 0.25 * f["melody"] - energy + 0.5 * m["happy"],              # closers: emotional, winding down
     ], axis=1)
     scores = (scores - scores.mean(axis=0)) / scores.std(axis=0)
+    for n, crates in enumerate(playlists or []):
+        for crate in crates:
+            for role, push in LEANS.get(crate, []):
+                scores[n, ROLES.index(role)] += push
+    # every song goes to its closest role, however clear the fit, so nothing has to
+    # be hunted for outside the folders
     roles = {r: [] for r in ROLES}
     for i, row in zip(ids, scores):
-        if row.max() >= 0.5:
-            roles[ROLES[row.argmax()]].append(i)
+        roles[ROLES[row.argmax()]].append(i)
     return roles
+
+
+CORRECTIONS = HERE / "corrections" / "corrections"  # <doc id>.json files fetched from the Crate Notes page
+
+
+def apply_corrections(roles: dict[str, list[str]], ids: list[str]) -> int:
+    """Move songs to the role you chose on the Crate Notes page ("Song corrections").
+    A song is matched by a hash of its normalised artist - title, so it survives a
+    re-import. Returns how many songs were moved."""
+    import hashlib
+    from curator import Library, track_key
+    chosen = {}
+    for f in CORRECTIONS.glob("*.json") if CORRECTIONS.exists() else []:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        data = data.get("data", data)
+        if data.get("role"):
+            chosen[f.stem] = data["role"]
+    if not chosen:
+        return 0
+    lib = Library()
+    by_name = {r[2:]: r for r in ROLES}
+    moved = 0
+    for i in ids:
+        if i not in lib.row:
+            continue
+        role = by_name.get(chosen.get("s-" + hashlib.sha1(track_key(*lib.label(i)).encode()).hexdigest()[:16], ""))
+        if role and i not in roles[role]:
+            for members in roles.values():
+                if i in members:
+                    members.remove(i)
+            roles[role].append(i)
+            moved += 1
+    return moved
 
 
 def main():
@@ -162,7 +221,11 @@ def main():
     cue_data = json.loads(cues.OUT.read_text())
     ids = [i for i in songs if i in cue_data]
     feats = audio_features(tracks, ids, cue_data)
-    roles = assign(ids, feats, model_scores(ids), [tracks[i]["bpm"] for i in ids])
+    roles = assign(ids, feats, model_scores(ids), [tracks[i]["bpm"] for i in ids],
+                   [tracks[i]["playlists"] for i in ids])
+    moved = apply_corrections(roles, ids)
+    if moved:
+        print(f"{moved} songs placed by your corrections")
 
     if args.arcs:
         tree = arcs(tracks, songs, roles)
@@ -185,11 +248,12 @@ def main():
 
 
 def arcs(tracks, songs, roles, width=8, min_tracks=2):
-    """Per Palettes sound family, its tracks split by role in set order. A family
-    spanning several tempo lanes gets a folder per lane (half-time folded towards
-    the family's tempo), with the roles inside, so moving from role to role keeps
-    both the palette and the tempo."""
-    from crosspollinate import mood_scores, palette_groups, palette_matrix
+    """Set arcs: Mood > your playlist > (sound style) > [tempo lane] > All, then the roles in
+    set order. A family spanning several tempo lanes gets a folder per lane (half-time
+    folded towards the family's tempo), so moving from role to role keeps both the palette
+    and the tempo. "All" holds every song of the lane and "Other tempos" the songs that fit
+    no lane, so no song is left out. This is the old Mood palettes folder with the roles added."""
+    from crosspollinate import mood_scores, mood_tree, palette_families, palette_matrix
     role_of = {i: role for role, members in roles.items() for i in members}
 
     def role_playlists(members, eff):
@@ -200,29 +264,37 @@ def arcs(tracks, songs, roles, width=8, min_tracks=2):
                 out.append({"name": role, "tracks": picked, "eff": eff})
         return out
 
-    tree = {"name": "Set arcs", "children": []}
-    for name, members in palette_groups(tracks, songs, palette_matrix(songs), mood_scores(songs)):
-        members = [i for i in members if i in role_of]
+    def leaf(name, family):
+        members = family["members"]                      # every song in the family, with or without a role
         eff = cluster.mix_bpm(members, tracks)
         lanes = [b for b in cluster.tempo_bands(members, eff, width) if len(b) >= 2 * min_tracks]
+
+        def lane_children(lane_members):
+            out = [{"name": "All", "tracks": sorted(lane_members, key=eff.get), "eff": eff}] if len(lane_members) >= 2 else []
+            return out + role_playlists(lane_members, eff)
+
         if len(lanes) <= 1:
-            children = role_playlists(members, eff)
+            children = lane_children(members)
         else:
-            children = []
-            for lane in lanes:
-                playlists = role_playlists(lane, eff)
-                if len(playlists) >= 2:
-                    children.append({"name": cluster.bpm_range(lane, eff), "children": playlists})
-            if len(children) == 1:  # one lane left: no need for a lane folder
-                children = children[0]["children"]
-        if len(children) >= 2 or (children and "children" in children[0]):
-            tree["children"].append({"name": name, "children": children})
-            print(f"\n{name}")
-            for c in children:
-                for pl in (c["children"] if "children" in c else [c]):
-                    lane = f"{c['name']:>8} " if "children" in c else ""
-                    bpms = [eff[i] for i in pl["tracks"]]
-                    print(f"    {lane}{pl['name']:22} {len(pl['tracks']):3} tracks  {min(bpms):.0f}-{max(bpms):.0f}")
+            children = [{"name": cluster.bpm_range(lane, eff), "children": lane_children(lane)} for lane in lanes]
+            placed = {i for lane in lanes for i in lane}
+            rest = sorted((i for i in members if i not in placed), key=lambda i: tracks[i]["bpm"])
+            if rest:
+                children.append({"name": "Other tempos", "tracks": rest})
+        return {"name": name, "children": children} if children else None
+
+    families = palette_families(tracks, songs, palette_matrix(songs), mood_scores(songs))
+    tree = {"name": "Set arcs", "children": mood_tree(families, leaf)}
+
+    def show(node, depth=0):
+        pad = "    " * depth
+        if "children" in node:
+            print(f"{pad}{node['name']}/")
+            for c in node["children"]:
+                show(c, depth + 1)
+        else:
+            print(f"{pad}{node['name']}  ({len(node['tracks'])})")
+    show(tree)
     return tree
 
 

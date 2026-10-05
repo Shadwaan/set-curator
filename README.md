@@ -131,36 +131,48 @@ $PY crosspollinate.py --apply --replace    # SC / Cross-pollination
   either that sound closest to the other; **Bridges (palette)** judges the same
   by shared sounds.
 - **Moods**: the library by Essentia mood (Dark & Driving, Peak Time, ...).
-- **Palettes**: the library grouped by shared sound palette, named by mood and
-  the crates each group mostly comes from.
 - **Relatives**: each of your productions (files under `~/Documents/Samples`),
   followed by the tracks sharing most of its palette.
 
 Every group is a folder of tempo playlists ("120-128", half-time folded), and
-copies of one song (separate files with the same audio) count once.
+copies of one song (separate files with the same audio) count once. (The library
+grouped by shared sound palette lives in Set arcs below.)
 
 ### Hot cues
 
 ```bash
-$PY cues.py            # detect -> cues.json
-$PY cues.py --apply    # write hot cues A/B/C into Rekordbox
+$PY cues.py                         # detect -> cues.json
+$PY cues.py --apply                 # write hot cues A/B/C into Rekordbox
+$PY cues.py --update cues_v1.json   # replace cues written earlier (the file holds what was written)
 ```
 
-A: the kick comes in. B: 8 bars before the first drop. C: the first drop at full
-energy. Positions come from Rekordbox's beatgrid and snap to 4/8-bar phrases.
-Tracks that already have cues are never touched; MP3s are skipped.
+A: the bar the kick comes in. B: 8 bars before the first drop. C: the first drop at
+full energy. Positions come from Rekordbox's beatgrid (read from its analysis files,
+so this works while Rekordbox is open) and sit on 4/8-bar lines. `--apply` never
+touches a track that already has cues and skips MP3s; `--update` only replaces cues
+that are still exactly where this tool put them, so cues you moved or added stay.
 
 ### Set roles and set arcs
 
 ```bash
-$PY roles.py --apply --replace          # SC / Set roles: 1 Openers ... 7 Closers
-$PY roles.py --arcs --apply --replace   # SC / Set arcs: roles inside each palette family
+$PY roles.py --apply --replace          # SC / Set roles: 1 Openers ... 8 Closers
+$PY roles.py --arcs --apply --replace   # SC / Set arcs
 ```
 
-Roles are judged against tracks at a similar tempo, from peak loudness, drop
-size, melody (pitch clarity), rhythmic busyness, intro length and Essentia moods.
-Set arcs keep a role sequence inside each sound family (and tempo lane), so
-moving from role to role keeps the palette as well as the tempo.
+Roles (Openers, Warmers, Momentum builders, Crowd attractors, Peak time, Sustainers,
+Moments, Closers) are judged against songs at a similar tempo (half-time folded) from
+peak loudness, drop size, melody (pitch clarity), rhythmic busyness, intro length and
+Essentia moods. Every song gets its closest role.
+
+- **Set arcs**: Mood > your playlist > (sound style) > [tempo lane] > "All" plus the
+  roles in set order, built from the library grouped by shared sound palette. "All"
+  and "Other tempos" make sure no song is left out.
+- **Your knowledge as nudges**: `playlist_leans.json` maps a playlist to the roles it
+  is for, e.g. `{"My Warm-up Crate": [["1 Openers", 0.3], ["2 Warmers", 0.4]]}`.
+  They only nudge the audio evidence.
+- **Song corrections**: put a song's role in `corrections/corrections/<id>.json`
+  (`{"role": "Openers"}`, id = `s-` plus the first 16 hex of the SHA-1 of the
+  normalised "artist - title"); it overrides the scoring.
 
 ### Curator app
 
