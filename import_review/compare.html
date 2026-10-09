@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compare versions</title>
+<style>
+:root{--bg:#0b0b10;--panel:#12121a;--line:#24242f;--ink:#e8e8ee;--mut:#8b8b99;--ok:#1db954;--warn:#ffd166;--bad:#ff8a9b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,system-ui,sans-serif;padding:16px}
+h1{font-size:18px;margin:0 0 4px}.sub{color:var(--mut);font-size:12px;margin-bottom:12px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+input[type=text]{background:#14141c;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:inherit;min-width:260px}
+button,.chip{background:#1c1c26;color:var(--ink);border:1px solid #2a2a38;border-radius:6px;padding:6px 10px;font:inherit;cursor:pointer}
+button:hover{background:#26263a}.on{border-color:var(--ok)!important}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}
+.card{background:var(--panel);border:2px solid var(--line);border-radius:10px;padding:12px;min-width:0}
+.card.playing{border-color:var(--ok)}.card h2{font-size:15px;margin:0 0 2px;word-break:break-word}
+.card .art{color:var(--mut);font-size:12px;margin-bottom:6px}
+.fact{font-size:12px;color:#b5b5c3;margin:2px 0;word-break:break-word}.fact b{color:var(--ink);font-weight:500}
+.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;background:#1b2c3d;color:#7cc4ff;margin:0 4px 4px 0}
+.tag.same{background:#3a1820;color:var(--bad)}.tag.close{background:#3a2f12;color:var(--warn)}.tag.diff{background:#173324;color:#7be3a1}
+audio{width:100%;height:38px;margin:8px 0 4px}.row{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.mark.keep.on{background:#173324}.mark.dup.on{background:#3a1820}
+.note{width:100%;margin-top:6px;padding:6px 8px;background:#14141c;color:var(--ink);border:1px solid var(--line);border-radius:6px;font:inherit;font-size:12px}
+.hint{color:var(--mut);font-size:12px;margin-top:12px}.empty{color:var(--mut);padding:20px}
+</style></head><body>
+<h1>Compare versions of a song</h1>
+<div class="sub">Every file in your library that matches the search, each with its own player. Only your marks are saved; nothing in Rekordbox or on the SSD changes.</div>
+<div class="bar">
+  <input type="text" id="q" placeholder="song name, e.g. horny"> <button id="go">Show</button>
+  <span style="color:var(--mut);font-size:12px">quick:</span>
+  <button class="chip" data-q="horny">Horny</button><button class="chip" data-q="untitled 07">Untitled 07</button>
+  <button class="chip" data-q="chopper">Chopper</button><button class="chip" data-q="arabian dance">Arabian Dance</button>
+</div>
+<div class="bar"><span style="color:var(--mut);font-size:12px">Set every player to</span>
+  <button data-seek="30">0:30</button><button data-seek="60">1:00</button><button data-seek="120">2:00</button><button data-seek="180">3:00</button><button data-seek="240">4:00</button>
+  <span style="color:var(--mut);font-size:12px">&nbsp;or press <b>▶ same spot</b> on a card to carry on from where the last one was.</span></div>
+<div class="grid" id="grid"></div>
+<div class="hint">Match = how alike the sound is to the first card (1.000 = the same audio). Playing one pauses the others. A first play of an AIFF takes a few seconds while it is prepared for the browser.</div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let items = [], last = { t: 0 };
+async function show(q) {
+  $('q').value = q; history.replaceState(null, '', '?q=' + encodeURIComponent(q));
+  document.querySelectorAll('[data-q]').forEach(b => b.classList.toggle('on', b.dataset.q === q.toLowerCase()));
+  $('grid').innerHTML = '<div class="empty">Looking…</div>';
+  items = await (await fetch('/api/compare/find?q=' + encodeURIComponent(q))).json();
+  $('grid').innerHTML = items.length ? '' : '<div class="empty">No files match that.</div>';
+  items.forEach((it, n) => $('grid').append(card(it, n)));
+}
+function card(it, n) {
+  const d = document.createElement('div'); d.className = 'card'; d.id = 'c' + it.id;
+  const m = it.match_first;
+  const mt = n === 0 ? '<span class="tag">first card</span>' : `<span class="tag ${m >= .995 ? 'same' : m >= .9 ? 'close' : 'diff'}">match with first ${m.toFixed(3)}${m >= .995 ? ' · same audio' : m >= .9 ? ' · very close' : ' · different'}</span>`;
+  d.innerHTML = `<h2>${esc(it.title)}</h2><div class="art">${esc(it.artist)}</div>${mt}
+    <div class="fact"><b>${esc(it.format)}</b> · ${esc(it.length)} · ${esc(it.size)}${it.bitrate ? ' · ' + esc(it.bitrate) : ''} · ${esc(it.bpm)} BPM · ${esc(it.key)}</div>
+    <div class="fact"><b>File</b> ${esc(it.where)}</div>
+    <div class="fact"><b>Your playlists</b> ${esc(it.playlists.join(', ') || 'none')}</div>
+    <div class="fact"><b>Comment</b> ${esc(it.comment || '—')}</div>
+    <div class="fact"><b>Rekordbox</b> ${it.analysed ? 'analysed · ' + it.cues + ' hot cues · in ' + it.sc_folders + ' SC folders' : 'not analysed'} · added ${esc(it.added)}</div>
+    <audio controls preload="none" src="/api/compare/audio/${it.id}"></audio>
+    <div class="row"><button data-here>▶ same spot</button>
+      <button class="mark keep ${it.mark === 'keep' ? 'on' : ''}" data-mark="keep">Keep this one</button>
+      <button class="mark dup ${it.mark === 'dup' ? 'on' : ''}" data-mark="dup">Duplicate / not wanted</button></div>
+    <input class="note" placeholder="note" value="${esc(it.note || '')}">`;
+  const a = d.querySelector('audio');
+  a.addEventListener('play', () => { document.querySelectorAll('audio').forEach(o => { if (o !== a) o.pause(); }); document.querySelectorAll('.card').forEach(c => c.classList.toggle('playing', c === d)); });
+  a.addEventListener('timeupdate', () => { if (!a.paused) last.t = a.currentTime; });
+  d.querySelector('[data-here]').onclick = () => { const go = () => { a.currentTime = last.t; a.play(); }; a.readyState >= 1 ? go() : (a.preload = 'auto', a.addEventListener('loadedmetadata', go, { once: true }), a.load()); };
+  const save = async mark => { await fetch('/api/compare/mark', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: it.id, mark, note: d.querySelector('.note').value }) }); };
+  d.querySelectorAll('[data-mark]').forEach(b => b.onclick = async () => { it.mark = it.mark === b.dataset.mark ? null : b.dataset.mark; d.querySelectorAll('[data-mark]').forEach(x => x.classList.toggle('on', x.dataset.mark === it.mark)); await save(it.mark); });
+  d.querySelector('.note').onchange = () => save(it.mark || null);
+  return d;
+}
+$('go').onclick = () => show($('q').value.trim());
+$('q').onkeydown = e => { if (e.key === 'Enter') show($('q').value.trim()); };
+document.querySelectorAll('[data-q]').forEach(b => b.onclick = () => show(b.dataset.q));
+document.querySelectorAll('[data-seek]').forEach(b => b.onclick = () => { last.t = +b.dataset.seek; document.querySelectorAll('audio').forEach(a => { const go = () => a.currentTime = last.t; a.readyState >= 1 ? go() : (a.preload = 'auto', a.addEventListener('loadedmetadata', go, { once: true }), a.load()); }); });
+show(new URLSearchParams(location.search).get('q') || 'horny');
+</script></body></html>
