@@ -31,6 +31,8 @@ def rekordbox_dir() -> Path:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(Path(__file__).with_name("tracks.json")))
+    ap.add_argument("--ignore-folder", action="append", default=["SC"], metavar="NAME",
+                    help="playlists inside a folder with this name are generated, not yours (default: SC)")
     args = ap.parse_args()
 
     src = rekordbox_dir() / "master.db"
@@ -42,7 +44,20 @@ def main():
         playlists = {}
         for sp in db.session.query(tables.DjmdSongPlaylist).all():
             playlists.setdefault(str(sp.ContentID), []).append(str(sp.PlaylistID))
-        playlist_names = {str(p.ID): p.Name for p in db.session.query(tables.DjmdPlaylist).all()}
+        all_playlists = {str(p.ID): p for p in db.session.query(tables.DjmdPlaylist).all()}
+
+        def generated(p) -> bool:
+            """Playlists this tool built (inside a folder named in --ignore-folder), Rekordbox's own
+            "CUE Analysis Playlist", and folders are not your playlists."""
+            if p.Attribute != 0 or p.Name == "CUE Analysis Playlist":
+                return True
+            while p is not None:
+                if p.Name in args.ignore_folder and p.Attribute == 1:
+                    return True
+                p = all_playlists.get(str(p.ParentID))
+            return False
+
+        playlist_names = {pid: p.Name for pid, p in all_playlists.items() if not generated(p)}
 
         tracks = []
         for c in db.session.query(tables.DjmdContent).all():
@@ -54,7 +69,7 @@ def main():
                 "key": c.KeyName or "",
                 "length": c.Length or 0,
                 "path": c.FolderPath or "",
-                "playlists": [playlist_names.get(p, p) for p in playlists.get(str(c.ID), [])],
+                "playlists": [playlist_names[p] for p in playlists.get(str(c.ID), []) if p in playlist_names],
             })
         db.session.close()
         db.engine.dispose()

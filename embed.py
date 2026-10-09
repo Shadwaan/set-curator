@@ -66,6 +66,8 @@ def main():
     tracks = json.loads((HERE / "tracks.json").read_text(encoding="utf-8"))
     # Rekordbox's bundled sampler sounds and demo tracks aren't music to curate
     tracks = [t for t in tracks if not re.search(r"/rekordbox/Sampler/|/PioneerDJ/Demo Tracks/", t["path"])]
+    skip = set(json.loads((HERE / "excluded.json").read_text(encoding="utf-8"))) if (HERE / "excluded.json").exists() else set()
+    tracks = [t for t in tracks if t["id"] not in skip]
     if args.exclude_playlist:
         tracks = [t for t in tracks if not t["playlists"] or set(t["playlists"]) - set(args.exclude_playlist)]
     if args.playlist:

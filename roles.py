@@ -159,7 +159,7 @@ LEANS = {k: [tuple(x) for x in v] for k, v in json.loads(LEANS_FILE.read_text(en
     if LEANS_FILE.exists() else {}
 
 
-def assign(ids, feats, models, bpms, playlists=None) -> dict[str, list[str]]:
+def assign(ids, feats, models, bpms, playlists=None, no_drive=None, song_nudges=None, listening=None) -> dict[str, list[str]]:
     z = lambda v: z_in_lane(v, bpms)
     f = {k: z([feats[i][k] for i in ids]) for k in ("peak_level", "contrast", "steady", "intro", "melody", "busy")}
     m = {k: z(v) for k, v in models.items()}
@@ -187,6 +187,22 @@ def assign(ids, feats, models, bpms, playlists=None) -> dict[str, list[str]]:
         for crate in crates:
             for role, push in LEANS.get(crate, []):
                 scores[n, ROLES.index(role)] += push
+    # your notes on single songs ("good sustainer"), see notes.py
+    for n, i in enumerate(ids):
+        for role, push in (song_nudges or {}).get(i, []):
+            scores[n, ROLES.index(role)] += push
+    # songs you flagged "hard to mix" are for listening: only Openers, Moments and Closers
+    for n, i in enumerate(ids):
+        if i in (listening or ()):
+            for role in ROLES:
+                if role not in ("1 Openers", "7 Moments", "8 Closers"):
+                    scores[n, ROLES.index(role)] -= 100
+    # reggae and dub songs (no_drive) are good for opening and warming but don't build momentum or
+    # drive a peak, so those two roles are closed to them
+    for n, blocked in enumerate(no_drive or []):
+        if blocked:
+            for role in ("3 Momentum builders", "5 Peak time"):
+                scores[n, ROLES.index(role)] -= 100
     # every song goes to its closest role, however clear the fit, so nothing has to
     # be hunted for outside the folders
     roles = {r: [] for r in ROLES}
@@ -228,28 +244,60 @@ def apply_corrections(roles: dict[str, list[str]], ids: list[str]) -> int:
     return moved
 
 
+REGGAE = 0.3  # share of reggae and dub styles (Discogs-400 model) above which a song counts as reggae-world
+REGGAE_CRATE = "Dub Reggae Bass Addict"  # your own crate for it (named "... AIFF" in Rekordbox): everything in it counts, whatever the model says
+
+
+def reggae_scores(ids) -> dict[str, float]:
+    classes, probs = cluster.style_predictions(ids)
+    cols = [k for k, c in enumerate(classes) if c.startswith("Reggae---")]
+    return {i: float(sum(probs[i][k] for k in cols)) for i in ids}
+
+
+def is_reggae(i, scores, tracks) -> bool:
+    return scores[i] >= REGGAE or any(REGGAE_CRATE in p for p in tracks[i]["playlists"])
+
+
+def reggae_tree(tracks, roles, members, width):
+    """SC / Dub & Reggae: the reggae-world songs by role (tempo playlists), a faster way to find them."""
+    keep = set(members)
+    tree = {"name": "Dub & Reggae", "children": []}
+    for role, ids in roles.items():
+        folder = tempo_folder(role, [i for i in ids if i in keep], tracks, width, 4, keep_rest=True)
+        if folder:
+            tree["children"].append(folder)
+            print(f"{role}: {sum(len(p['tracks']) for p in folder['children'])} songs")
+    return tree
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bpm-width", type=float, default=8)
     ap.add_argument("--apply", action="store_true", help="write SC / Set roles into Rekordbox")
     ap.add_argument("--replace", action="store_true", help="rebuild the folder if it already exists")
+    ap.add_argument("--reggae", action="store_true", help="SC / Dub & Reggae: the reggae-world songs by role")
     ap.add_argument("--arcs", action="store_true",
                     help="SC / Set arcs instead: within each Palettes sound family, one playlist per role, "
                          "so moving between roles keeps the palette as well as the tempo")
     args = ap.parse_args()
 
     tracks, ids, vecs = cluster.load(["Deep Tech FLAC"])
-    songs, _, _ = cluster.merge_copies(tracks, ids, vecs)
+    songs, _, merged = cluster.merge_copies(tracks, ids, vecs)
     cue_data = json.loads(cues.OUT.read_text())
     ids = [i for i in songs if i in cue_data]
     feats = audio_features(tracks, ids, cue_data)
+    reggae = reggae_scores(ids)
+    import notes
     roles = assign(ids, feats, model_scores(ids), [tracks[i]["bpm"] for i in ids],
-                   [tracks[i]["playlists"] for i in ids])
+                   [tracks[i]["playlists"] for i in ids], [is_reggae(i, reggae, tracks) for i in ids],
+                   notes.role_nudges(merged), notes.listening(merged))
     moved = apply_corrections(roles, ids)
     if moved:
         print(f"{moved} songs placed by your corrections")
 
-    if args.arcs:
+    if args.reggae:
+        tree = reggae_tree(tracks, roles, [i for i in ids if is_reggae(i, reggae, tracks)], args.bpm_width)
+    elif args.arcs:
         tree = arcs(tracks, songs, roles)
     else:
         tree = role_folders(tracks, ids, roles, args.bpm_width)
@@ -281,7 +329,7 @@ def arcs(tracks, songs, roles, width=8, min_tracks=2):
     def role_playlists(members, eff):
         out = []
         for role in ROLES:
-            picked = sorted((i for i in members if role_of.get(i) == role), key=eff.get)
+            picked = sorted((i for i in members if role_of.get(i) == role), key=cluster.blend_key(eff))
             if len(picked) >= min_tracks:
                 out.append({"name": role, "tracks": picked, "eff": eff})
         return out
@@ -292,7 +340,7 @@ def arcs(tracks, songs, roles, width=8, min_tracks=2):
         lanes = [b for b in cluster.tempo_bands(members, eff, width) if len(b) >= 2 * min_tracks]
 
         def lane_children(lane_members):
-            out = [{"name": "All", "tracks": sorted(lane_members, key=eff.get), "eff": eff}] if len(lane_members) >= 2 else []
+            out = [{"name": "All", "tracks": sorted(lane_members, key=cluster.blend_key(eff)), "eff": eff}] if len(lane_members) >= 2 else []
             return out + role_playlists(lane_members, eff)
 
         if len(lanes) <= 1:

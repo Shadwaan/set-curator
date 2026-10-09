@@ -27,12 +27,19 @@ STYLE_MODEL = HERE / "models" / "genre_discogs400-discogs-effnet-1.pb"
 STYLE_LABELS = HERE / "models" / "genre_discogs400-discogs-effnet-1.json"
 
 
+def excluded() -> set[str]:
+    """Track ids kept out of every analysis and folder (excluded.json: {id: reason})."""
+    f = HERE / "excluded.json"
+    return set(json.loads(f.read_text(encoding="utf-8"))) if f.exists() else set()
+
+
 def load(exclude_playlists=()):
     tracks = {t["id"]: t for t in json.loads((HERE / "tracks.json").read_text(encoding="utf-8"))}
     data = np.load(HERE / "embeddings.npz")
     ids = [str(i) for i in data["ids"]]
     vecs = data["vectors"] / np.linalg.norm(data["vectors"], axis=1, keepdims=True)
-    keep = [n for n, i in enumerate(ids) if i in tracks and os.path.exists(tracks[i]["path"])
+    skip = excluded()
+    keep = [n for n, i in enumerate(ids) if i in tracks and i not in skip and os.path.exists(tracks[i]["path"])
             and "/rekordbox/Sampler/" not in tracks[i]["path"]
             and not set(tracks[i]["playlists"]) & set(exclude_playlists)]
     # lossless first, so it is the copy kept when the same audio exists twice
@@ -51,7 +58,7 @@ def merge_copies(tracks, ids, vecs):
     import re
     def key(t):
         artist, title = t["artist"], t["title"]
-        if not artist and " - " in title:
+        if not artist and " - " in title and not re.match(r"^(original|extended|radio|club|dub|instrumental|vocal|edit)?\s*(mix|edit|version|remix)$", title.split(" - ", 1)[1].strip(), re.I):
             artist, title = title.split(" - ", 1)
         n = lambda x: re.sub(r"[^a-z0-9]+", " ", (x or "").lower()).strip()
         return n(artist), n(title)
@@ -87,9 +94,34 @@ def mix_bpm(group, tracks):
             for i in group}
 
 
+_OPENNESS = None
+
+
+def openness() -> dict[str, float]:
+    """Each song's high-end openness (more open = higher), from highend.json; empty if not measured."""
+    global _OPENNESS
+    if _OPENNESS is None:
+        f = HERE / "highend.json"
+        _OPENNESS = {}
+        if f.exists():
+            h = json.loads(f.read_text())
+            if h:
+                p = np.array([v["presence"] for v in h.values()]); a = np.array([v["air"] for v in h.values()])
+                zp, za = (p - p.mean()) / p.std(), (a - a.mean()) / a.std()
+                _OPENNESS = {i: float((x + y) / 2) for i, x, y in zip(h, zp, za)}
+    return _OPENNESS
+
+
+def blend_key(eff):
+    """Sort key for playlists: tempo first, then the high end (closed to open) among songs at the same
+    tempo, so neighbouring songs blend without a jump in brightness."""
+    op = openness()
+    return lambda i: (round(eff[i]), op.get(i, 0.0))
+
+
 def tempo_bands(group, eff, width):
     bands = []
-    for i in sorted(group, key=eff.get):
+    for i in sorted(group, key=blend_key(eff)):
         if bands and eff[i] - eff[bands[-1][0]] <= width:
             bands[-1].append(i)
         else:
@@ -240,6 +272,8 @@ def main():
     ap.add_argument("--exclude-playlist", action="append", default=[], metavar="NAME",
                     help="leave out tracks in this Rekordbox playlist (repeatable)")
     ap.add_argument("--folder", default="SC", help="name of the top-level Rekordbox folder")
+    ap.add_argument("--only", metavar="PLAYLIST", help="--per-playlist: rebuild just that playlist's folder inside the "
+                    "existing folder, leaving everything else as it is")
     ap.add_argument("--apply", action="store_true", help="write the folder tree into Rekordbox")
     ap.add_argument("--replace", action="store_true", help="rebuild the folder if it already exists (same position)")
     args = ap.parse_args()
@@ -325,7 +359,13 @@ def main():
             return {"name": node["name"], "children": [to_tracks(c) for c in node["children"]]}
         return {"name": node["name"], "tracks": [tracks[i] for i in node["tracks"]]}
 
-    result = write_folder(to_tracks(tree), replace=args.replace)
+    if args.only:
+        mine = [c for c in tree["children"] if c["name"] == args.only]
+        if not mine:
+            raise SystemExit(f"No playlist folder named '{args.only}' in the tree")
+        result = write_folder(to_tracks(mine[0]), parent=args.folder, replace=True)
+    else:
+        result = write_folder(to_tracks(tree), replace=args.replace)
     print(f"\nCreated '{args.folder}': {result['folders']} folders, {result['playlists']} playlists, "
           f"{result['added']} tracks. Backup: {result['backup']}")
     for t in result["missing"]:

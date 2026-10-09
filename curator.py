@@ -18,6 +18,7 @@ import numpy as np
 import palette
 
 HERE = Path(__file__).parent
+MIX_ONLY = re.compile(r"^(original|extended|radio|club|dub|instrumental|vocal|edit|12\"|7\")?\s*(mix|edit|version|remix)$", re.I)
 STAND_INS = 3        # released library tracks used for a seed cosine.club doesn't know
 WEB_PER_SEED = 100   # candidates fetched per web seed (API max per page)
 
@@ -40,7 +41,9 @@ class Library:
         tracks = {t["id"]: t for t in json.loads((HERE / "tracks.json").read_text(encoding="utf-8"))}
         data = np.load(HERE / "embeddings.npz")
         ids = [str(i) for i in data["ids"]]
-        keep = [n for n, i in enumerate(ids) if i in tracks and os.path.exists(tracks[i]["path"])
+        skip = set(json.loads((HERE / "excluded.json").read_text(encoding="utf-8"))) \
+            if (HERE / "excluded.json").exists() else set()
+        keep = [n for n, i in enumerate(ids) if i in tracks and i not in skip and os.path.exists(tracks[i]["path"])
                 and "/rekordbox/Sampler/" not in tracks[i]["path"]]
         self.tracks = tracks
         self.ids = [ids[n] for n in keep]
@@ -58,8 +61,13 @@ class Library:
             return t["artist"], t["title"]
         # untagged tracks often carry "Artist - Title" in the title or the file name
         if " - " in t["title"]:
-            artist, title = t["title"].split(" - ", 1)
-            return artist.strip(), title.strip()
+            left, right = (x.strip() for x in t["title"].split(" - ", 1))
+            if MIX_ONLY.match(right):
+                # "Song - Original Mix": the right part is a version, so the left part is the title;
+                # the artist, if any, is in a file name like "202-modjo-chillin.aiff"
+                m = re.match(r"^\d*[-_. ]*([^-_]+)[-_]", Path(t["path"]).stem)
+                return (m.group(1).strip().title() if m else ""), t["title"]
+            return left, right
         stem = Path(t["path"]).stem
         stem = re.sub(r"^\d+[\s.\-]+", "", stem)
         if " - " in stem and norm(t["title"]) in norm(stem):

@@ -155,6 +155,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--match", help="only tracks whose artist/title contains this")
+    ap.add_argument("--redo", action="store_true", help="detect every song again, not just those without cues yet")
     ap.add_argument("--apply", action="store_true", help="write the cues in cues.json into Rekordbox")
     ap.add_argument("--update", metavar="FILE", help="replace cues this tool wrote earlier (FILE holds the positions "
                     "it wrote, e.g. cues_v1.json) with the ones in cues.json; cues you changed are left alone")
@@ -176,8 +177,11 @@ def main():
     if args.match:
         ids = [i for i in ids if args.match.lower() in cluster.label_of(tracks[i]).lower()]
     ids = ids[: args.limit] if args.limit else ids
-    paths = analysis_paths_from_files({i: tracks[i] for i in ids})
     out = json.loads(OUT.read_text()) if OUT.exists() else {}
+    if not (args.redo or args.match):
+        ids = [i for i in ids if i not in out]          # only songs with no cues yet
+        print(f"{len(ids)} songs without detected cues")
+    paths = analysis_paths_from_files({i: tracks[i] for i in ids})
     for n, i in enumerate(ids, 1):
         if i not in paths:
             print(f"[{n}/{len(ids)}] no Rekordbox analysis: {cluster.label_of(tracks[i])}")
