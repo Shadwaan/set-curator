@@ -467,3 +467,249 @@ def update_hot_cues(new: dict[str, dict[str, float]], written: dict[str, dict[st
     result = write_hot_cues({cid: new[cid] for cid in todo}) if todo else {"written": 0}
     updated = result["written"]
     return {"updated": updated, "skipped": skipped, "backup": str(backup)}
+
+
+def write_comments(prefixes: dict[str, str]) -> dict:
+    """Put `prefixes[track id]` at the start of each song's Rekordbox comment ("Commnt"), keeping
+    whatever comment text was there. A prefix this tool wrote earlier (it looks like
+    "[OPEN | Crate names]") is replaced, so running it again never stacks tags. One transaction,
+    one backup; tracks whose comment would not change are not touched."""
+    import re
+    from pyrekordbox.db6 import tables
+
+    if not os.environ.get("SET_CURATOR_RB_DIR") and is_rekordbox_running():
+        raise RuntimeError("Close Rekordbox first -- it overwrites master.db with its in-memory copy")
+
+    backup = backup_master_db()
+    db = open_db()
+    changed = unchanged = 0
+    old_tag = re.compile(r"^\[(OPEN|BAL|CLOSED)[^\]]*\]\s*")
+    try:
+        usn = _next_usn(db, tables.DjmdContent)
+        now = datetime.now(timezone.utc)
+        for cid, prefix in prefixes.items():
+            row = db.session.query(tables.DjmdContent).filter_by(ID=cid).first()
+            if row is None:
+                continue
+            rest = old_tag.sub("", row.Commnt or "")
+            new = (prefix + " " + rest).strip()
+            if new == (row.Commnt or ""):
+                unchanged += 1
+                continue
+            row.Commnt = new
+            row.updated_at = now
+            row.rb_local_usn = usn
+            usn += 1
+            changed += 1
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    finally:
+        db.session.close()
+        db.engine.dispose()
+    flush_wal()
+    return {"changed": changed, "unchanged": unchanged, "backup": str(backup)}
+
+
+def remove_track_traces(cid: str, apply: bool = False) -> dict:
+    """Take a track out of every playlist, delete its cues and strip this tool's comment tag. The
+    collection entry and the audio file stay. Without `apply` it only reports what it would do
+    (read-only, so it also works while Rekordbox is open)."""
+    import re
+    from pyrekordbox.db6 import tables
+
+    if apply and not os.environ.get("SET_CURATOR_RB_DIR") and is_rekordbox_running():
+        raise RuntimeError("Close Rekordbox first -- it overwrites master.db with its in-memory copy")
+
+    backup = backup_master_db() if apply else None
+    db = open_db()
+    try:
+        content = db.session.query(tables.DjmdContent).filter_by(ID=cid).first()
+        if content is None:
+            return {"in_collection": False}
+        songs = db.session.query(tables.DjmdSongPlaylist).filter_by(ContentID=cid).all()
+        names = []
+        for s in songs:
+            pl = db.session.query(tables.DjmdPlaylist).filter_by(ID=s.PlaylistID).first()
+            names.append(pl.Name if pl else str(s.PlaylistID))
+        cues = db.session.query(tables.DjmdCue).filter_by(ContentID=cid).count()
+        comment = content.Commnt or ""
+        stripped = re.sub(r"^\[(OPEN|BAL|CLOSED)[^\]]*\]\s*", "", comment)
+        report = {"in_collection": True, "title": content.Title, "playlists": sorted(names), "cues": cues,
+                  "comment": comment, "comment_after": stripped, "backup": str(backup) if backup else None}
+        if not apply:
+            return report
+        usn = _next_usn(db, tables.DjmdSongPlaylist)
+        pids = {str(s.PlaylistID) for s in songs}
+        db.session.query(tables.DjmdSongPlaylist).filter_by(ContentID=cid).delete(synchronize_session=False)
+        db.session.flush()
+        for pid in pids:                                     # close the gap in each playlist's numbering
+            rest = db.session.query(tables.DjmdSongPlaylist).filter_by(PlaylistID=pid) \
+                .order_by(tables.DjmdSongPlaylist.TrackNo).all()
+            for n, s in enumerate(rest, 1):
+                if s.TrackNo != n:
+                    s.TrackNo = n
+                    s.rb_local_usn = usn
+                    usn += 1
+        db.session.query(tables.DjmdCue).filter_by(ContentID=cid).delete(synchronize_session=False)
+        db.session.query(tables.ContentCue).filter_by(ContentID=cid).delete(synchronize_session=False)
+        if stripped != comment:
+            content.Commnt = stripped
+            content.updated_at = datetime.now(timezone.utc)
+            content.rb_local_usn = _next_usn(db, tables.DjmdContent)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    finally:
+        db.session.close()
+        db.engine.dispose()
+    flush_wal()
+    return report
+
+
+def remove_from_collection(cid: str, expect_file_ending: str) -> dict:
+    """Take one song out of the Rekordbox collection: first out of every playlist (renumbering them), then every row that
+    points at it, then the collection entry itself. The audio file and the artist/album records stay. Refuses unless
+    the entry's file name ends with `expect_file_ending` (so a wrong ID can never remove another song), and while
+    Rekordbox is running. Backs up master.db first (remove_track_traces does it)."""
+    from pyrekordbox.db6 import tables as T
+    import inspect
+
+    db = open_db()
+    try:
+        c = db.session.query(T.DjmdContent).filter_by(ID=cid).first()
+        if c is None:
+            return {"removed": False, "why": "not in the collection"}
+        if not (c.FolderPath or "").lower().endswith(expect_file_ending.lower()):
+            raise RuntimeError(f"ID {cid} is {c.FolderPath!r}, not a file ending {expect_file_ending!r}: nothing removed")
+        title, path = c.Title, c.FolderPath
+    finally:
+        db.session.close()
+        db.engine.dispose()
+
+    first = remove_track_traces(cid, apply=True)        # playlists, cues, comment (refuses while Rekordbox is open)
+    db = open_db()
+    try:
+        tables = [cls for _, cls in inspect.getmembers(T, inspect.isclass) if hasattr(cls, "__tablename__") and hasattr(cls, "ContentID")]
+        dropped = {}
+        for cls in tables:
+            n = db.session.query(cls).filter_by(ContentID=cid).delete(synchronize_session=False)
+            if n:
+                dropped[cls.__name__] = n
+        db.session.query(T.DjmdContent).filter_by(ID=cid).delete(synchronize_session=False)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    finally:
+        db.session.close()
+        db.engine.dispose()
+    flush_wal()
+    return {"removed": True, "title": title, "file": path, "from_playlists": first["playlists"], "other_rows": dropped, "backup": first["backup"]}
+
+
+def apply_title_edits(edits: dict[str, dict]) -> dict:
+    """Write song titles you edited in the import review ({content id: {"title": ...}}) into Rekordbox. Only the
+    title changes (an artist edit is reported, not applied). One transaction, one backup; refuses while Rekordbox is open."""
+    from pyrekordbox.db6 import tables as T
+
+    if not os.environ.get("SET_CURATOR_RB_DIR") and is_rekordbox_running():
+        raise RuntimeError("Close Rekordbox first -- it overwrites master.db with its in-memory copy")
+    backup = backup_master_db()
+    db = open_db()
+    changed, same, missing, artist_notes = [], 0, [], []
+    try:
+        usn = _next_usn(db, T.DjmdContent)
+        now = datetime.now(timezone.utc)
+        for cid, e in edits.items():
+            row = db.session.query(T.DjmdContent).filter_by(ID=cid).first()
+            if row is None:
+                missing.append(cid)
+                continue
+            title = (e.get("title") or "").strip()
+            if title and title != row.Title:
+                changed.append((cid, row.Title, title))
+                row.Title = title
+                row.updated_at = now
+                row.rb_local_usn = usn
+                usn += 1
+            else:
+                same += 1
+            artist = (e.get("artist") or "").strip()
+            if artist and row.ArtistID and artist != (getattr(row, "ArtistName", None) or artist):
+                artist_notes.append((cid, artist))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    finally:
+        db.session.close()
+        db.engine.dispose()
+    flush_wal()
+    return {"changed": changed, "unchanged": same, "missing": missing, "artist_not_applied": artist_notes, "backup": str(backup)}
+
+
+def restore_song_from_backup(cid: str, backup_path: str, playlist_name: str, with_history: bool = False) -> dict:
+    """Put one song that was removed from the collection back, copied exactly (collection entry, analysis rows, hot cues)
+    from an earlier master.db backup, and into your own playlist `playlist_name` at the place it had. Refuses if the song
+    is in the library already, and while Rekordbox is running. Backs up master.db first."""
+    import inspect
+    from pyrekordbox import Rekordbox6Database
+    from pyrekordbox.db6 import tables as T
+
+    if not os.environ.get("SET_CURATOR_RB_DIR") and is_rekordbox_running():
+        raise RuntimeError("Close Rekordbox first -- it overwrites master.db with its in-memory copy")
+    old = Rekordbox6Database(path=backup_path)
+    live = open_db()
+    backup = backup_master_db()
+    copied = {}
+    try:
+        if live.session.query(T.DjmdContent).filter_by(ID=cid).first() is not None:
+            return {"restored": False, "why": "already in the collection"}
+        if old.session.query(T.DjmdContent).filter_by(ID=cid).first() is None:
+            return {"restored": False, "why": "not in that backup"}
+        user_pl = live.session.query(T.DjmdPlaylist).filter_by(Name=playlist_name, ParentID="root", Attribute=0).first()
+        if user_pl is None:
+            raise RuntimeError(f"No playlist '{playlist_name}' at the top level")
+        old_pl = old.session.query(T.DjmdPlaylist).filter_by(ID=str(user_pl.ID)).first()
+        old_entry = old.session.query(T.DjmdSongPlaylist).filter_by(ContentID=cid, PlaylistID=str(user_pl.ID)).first()
+        spots = [cls for _, cls in inspect.getmembers(T, inspect.isclass) if hasattr(cls, "__tablename__")
+                 and hasattr(cls, "ContentID") and cls not in (T.DjmdSongPlaylist, T.DjmdSongHistory)]
+        if with_history:                                  # your play history (the parent history sessions are still in the library)
+            spots.append(T.DjmdSongHistory)
+        clone = lambda cls, row: cls(**{c.name: getattr(row, c.name) for c in cls.__table__.columns})
+        content = old.session.query(T.DjmdContent).filter_by(ID=cid).first()
+        live.session.add(clone(T.DjmdContent, content))
+        copied["DjmdContent"] = 1
+        for cls in spots:
+            rows = old.session.query(cls).filter_by(ContentID=cid).all()
+            for r in rows:
+                live.session.add(clone(cls, r))
+            if rows:
+                copied[cls.__name__] = len(rows)
+        live.session.flush()
+        if old_entry is not None:
+            members = live.session.query(T.DjmdSongPlaylist).filter_by(PlaylistID=str(user_pl.ID)).order_by(T.DjmdSongPlaylist.TrackNo).all()
+            usn = _next_usn(live, T.DjmdSongPlaylist)
+            row = T.DjmdSongPlaylist()
+            row.ID = _new_id(live, T.DjmdSongPlaylist, 10**9, 10**10 - 1)
+            row.PlaylistID, row.ContentID = str(user_pl.ID), cid
+            _sync_fields(row, usn)
+            at = max(0, min((old_entry.TrackNo or len(members) + 1) - 1, len(members)))
+            members.insert(at, row)
+            live.session.add(row)
+            for n, m in enumerate(members, 1):
+                m.TrackNo = n
+            copied["DjmdSongPlaylist"] = 1
+        live.session.commit()
+    except Exception:
+        live.session.rollback()
+        raise
+    finally:
+        for d in (old, live):
+            d.session.close()
+            d.engine.dispose()
+    flush_wal()
+    return {"restored": True, "title": content.Title, "copied": copied, "backup": str(backup)}
