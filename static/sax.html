@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sax Check</title>
+<style>
+:root {
+  --bg: #ecebe6; --panel: #f7f6f2; --ink: #1d2b24; --muted: #66706a; --line: #d4d2ca;
+  --accent: #2f5d4a; --accent-ink: #f7f6f2; --yes: #2f5d4a; --no: #a3542b; --maybe: #8a7a2a;
+  --font: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141816; --panel: #1c211e; --ink: #e3e6e1; --muted: #8f9a93; --line: #2d3430;
+    --accent: #8cc7a8; --accent-ink: #141816; --yes: #8cc7a8; --no: #e0a17d; --maybe: #d9c56b;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--font); }
+header { display: flex; align-items: center; gap: 16px; padding: 14px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+button { font: inherit; color: var(--ink); background: none; border: 1px solid var(--line); border-radius: 3px; padding: 6px 12px; cursor: pointer; }
+.tabs button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.tally { margin-left: auto; color: var(--muted); font-size: 12px; }
+main { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; display: grid; gap: 20px; }
+.q { color: var(--muted); margin: 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 20px; display: grid; gap: 14px; min-width: 0; }
+.card h2 { margin: 0; font-size: 18px; overflow-wrap: anywhere; text-wrap: balance; }
+.card .artist { color: var(--muted); margin: 0; overflow-wrap: anywhere; }
+.where { color: var(--muted); font-size: 12px; }
+audio { width: 100%; }
+.answers { display: flex; gap: 8px; flex-wrap: wrap; }
+.answers button { flex: 1 1 140px; padding: 12px; font-size: 14px; }
+.answers button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.answers button.none.on { background: var(--no); border-color: var(--no); }
+.label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+.nav { display: flex; justify-content: space-between; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
+textarea { width: 100%; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px; resize: vertical; min-height: 64px; }
+.saved { color: var(--muted); font-size: 12px; min-height: 1em; }
+.lookup { display: grid; gap: 18px; }
+.lookup input { width: 100%; font: inherit; font-size: 15px; padding: 10px 12px; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 3px; }
+.found { display: grid; gap: 10px; padding-top: 16px; border-top: 1px solid var(--line); min-width: 0; }
+.found h2 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.hint { color: var(--muted); font-size: 12px; }
+.list { display: grid; gap: 2px; }
+.list button { text-align: left; display: flex; gap: 10px; align-items: baseline; border-color: transparent; padding: 5px 8px; min-width: 0; }
+.list button.cur { border-color: var(--accent); background: var(--panel); }
+.list .dot { width: 3.2em; flex: none; }
+.list .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.dot { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sax Check</h1>
+  <div class="tabs" id="tabs"></div>
+  <div class="tally" id="tally"></div>
+</header>
+<main>
+  <p class="q" id="question"></p>
+  <div class="card" id="card"></div>
+  <div class="hint">Keys: 1 sax, 2 melody, 3 room (press again to undo), 0 none of these, on the Aura tab 1 = has the aura and 2 = no aura, on More to check 1-3 sax groups and 4 / 5 aura yes / no (it moves on by itself about a second after your last press), &larr; &rarr; or Enter previous / next, Space play / pause. Everything saves as you go. In the list: S sax, M melody, R room, &mdash; none, &middot; not sorted yet.</div>
+  <div class="list" id="list"></div>
+</main>
+<script>
+let groups = [], names = [], g = 0, n = 0;
+const $ = id => document.getElementById(id);
+const fmt = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+const opts = grp => grp.options || names;
+const SHORT = { "Has sax": "S", "Melody a sax could play": "M", "Room for a sax": "R" };
+const KEYS = ["Has sax", "Melody a sax could play", "Room for a sax"];
+
+async function load() {
+  const d = await (await fetch("/api/sax")).json();
+  groups = d.groups; names = d.names;
+  // a song can be in two candidate lists: keep one shared state per song
+  const byId = {};
+  groups.filter(x => !x.options).forEach(grp => grp.songs.forEach(s => { byId[s.id] = byId[s.id] || s; }));
+  groups.filter(x => !x.options).forEach(grp => grp.songs = grp.songs.map(s => byId[s.id]));
+  g = Math.max(0, groups.findIndex(x => x.songs.some(s => s.filed === null)));
+  n = Math.max(0, groups[g].songs.findIndex(s => s.filed === null));
+  render();
+}
+
+let lookup = false, found = [];
+function tabsOnly() {
+  $("tabs").innerHTML = "";
+  groups.forEach((grp, k) => { const b = document.createElement("button"); b.textContent = grp.name; b.onclick = () => { lookup = false; g = k; n = Math.max(0, grp.songs.findIndex(s => s.filed === null)); render(); }; $("tabs").append(b); });
+  const lb = document.createElement("button"); lb.className = "on"; lb.textContent = "Look up a song"; $("tabs").append(lb);
+}
+async function search(q) {
+  found = await (await fetch("/api/sax/lookup?q=" + encodeURIComponent(q))).json();
+  renderLookup();
+}
+function renderLookup() {
+  const card = $("card"), box = document.createElement("div");
+  box.className = "lookup";
+  const inp = document.createElement("input"); inp.id = "q"; inp.placeholder = "Search your library, e.g. man with the red face";
+  inp.value = window.lastQ || ""; inp.onkeydown = e => { e.stopPropagation(); if (e.key === "Enter") { window.lastQ = inp.value; search(inp.value); } };
+  box.append(inp);
+  if (!found.length) { const m = document.createElement("div"); m.className = "hint"; m.textContent = "Press Enter to search."; box.append(m); }
+  found.forEach(f => {
+    const row = document.createElement("div"); row.className = "found";
+    const h = document.createElement("h2"); h.textContent = f.title;
+    const a = document.createElement("p"); a.className = "artist"; a.textContent = `${f.artist}  \u00b7  ${fmt(f.length)}  \u00b7  ${Math.round(f.bpm || 0)} BPM  \u00b7  ${f.crates.join(", ")}`;
+    const fl = document.createElement("p"); fl.className = "where"; fl.textContent = f.file;
+    const audio = document.createElement("audio"); audio.controls = true; audio.preload = "metadata";
+    const status = document.createElement("div"); status.className = "saved";
+    let base = Math.floor(Math.max(0, Math.min(f.length * 0.4, f.length - 30)));
+    audio.src = clip(f.id, base);                           // 30 s clips: jump anywhere, or load the whole track
+    const setStart = t => {
+      base = Math.floor(Math.max(0, Math.min(t, Math.max(f.length - 30, 0))));
+      status.textContent = "loading\u2026"; audio.src = clip(f.id, base);
+      audio.play().catch(() => { status.textContent = "press play (the browser blocked autoplay)"; });
+    };
+    audio.onerror = () => { status.textContent = "could not load this clip"; };
+    audio.onplaying = () => { status.textContent = ""; };
+    const jumps = document.createElement("div"); jumps.className = "answers";
+    [["Start", 0], ["25%", .25], ["50%", .5], ["75%", .75]].forEach(([lab, frac]) => {
+      const b = document.createElement("button"); b.textContent = `${lab} (${fmt(f.length * frac)})`; b.onclick = () => setStart(f.length * frac); jumps.append(b);
+    });
+    const ans = document.createElement("div"); ans.className = "answers";
+    const filedBtns = [];
+    const file = async list => {
+      f.filed = list; filedBtns.forEach(([nm, b]) => { b.className = list.includes(nm) ? "on" : ""; });
+      await fetch("/api/sax/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: f.id, groups: list }) });
+    };
+    names.forEach(nm => {
+      const b = document.createElement("button"); b.textContent = nm; b.className = (f.filed || []).includes(nm) ? "on" : "";
+      b.onclick = () => { const c = f.filed || []; file(c.includes(nm) ? c.filter(x => x !== nm) : [...c, nm]); }; ans.append(b); filedBtns.push([nm, b]);
+    });
+    const au = document.createElement("div"); au.className = "answers";
+    const auraBtns = [];
+    ["Has the aura", "No aura"].forEach(nm => {
+      const b = document.createElement("button"); b.textContent = nm; b.className = (f.aura || []).includes(nm) ? "on" : "";
+      b.onclick = async () => {
+        f.aura = (f.aura || []).includes(nm) ? [] : [nm]; auraBtns.forEach(([n2, b2]) => { b2.className = f.aura.includes(n2) ? "on" : ""; });
+        await fetch("/api/aura/answer", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: f.id, groups: f.aura }) });
+      }; au.append(b); auraBtns.push([nm, b]);
+    });
+    row.append(h, a, fl, audio, status, wholeButton(audio, f.id, () => base), jumps, ans, au); box.append(row);
+  });
+  card.dataset.id = ""; card.innerHTML = ""; card.append(box);
+  const keep = inp.value; inp.focus(); inp.setSelectionRange(keep.length, keep.length);
+}
+
+const clip = (id, start) => `/api/snippet/${id}?start=${Math.max(0, Math.floor(start))}`;
+// "Play whole track": swaps the 30 s clip for the full song (slower to load) at the same place, still scrubbable
+function wholeButton(audio, id, base) {
+  const b = document.createElement("button"); b.className = "whole"; b.textContent = "Play whole track";
+  b.onclick = () => {
+    const at = base() + audio.currentTime, was = !audio.paused;
+    b.textContent = "loading the whole track\u2026"; b.disabled = true;
+    audio.src = `/api/full/${id}`; audio.preload = "auto";
+    audio.addEventListener("loadedmetadata", () => { audio.currentTime = at; if (was) audio.play(); b.textContent = "whole track loaded"; }, { once: true });
+  };
+  return b;
+}
+
+function render() {
+  if (lookup) { $("list").innerHTML = ""; $("question").textContent = "Look up any song in your library, listen anywhere in it, and file it."; tabsOnly(); renderLookup(); return; }
+  $("tabs").innerHTML = "";
+  groups.forEach((grp, k) => {
+    const done = grp.songs.filter(s => s.filed !== null).length;
+    const b = document.createElement("button");
+    b.textContent = `${grp.name} (${done}/${grp.songs.length})`;
+    b.className = k === g ? "on" : "";
+    b.onclick = () => { clearTimeout(advance); lookup = false; g = k; n = Math.max(0, grp.songs.findIndex(s => s.filed === null)); render(); };
+    $("tabs").append(b);
+  });
+  const lb = document.createElement("button"); lb.textContent = "Look up a song"; lb.onclick = () => { clearTimeout(advance); lookup = true; if (!found.length) { window.lastQ = window.lastQ || "man with the red face"; search(window.lastQ); } render(); };
+  $("tabs").append(lb);
+  const grp = groups[g], s = grp.songs[n];
+  const all = [...new Map(groups.filter(x => !x.options).flatMap(x => x.songs).map(x => [x.id, x])).values()];
+  const aura = groups.find(x => x.name === "Aura check");
+  const inGroup = nm => all.filter(x => (x.filed || []).includes(nm)).length;
+  $("tally").textContent = `filed: sax ${inGroup(names[0])} · melody ${inGroup(names[1])} · room ${inGroup(names[2])} · ${all.filter(x => x.filed === null).length} unsorted`
+    + (aura ? ` \u00b7 aura: ${aura.songs.filter(x => (x.filed || []).includes(aura.options[0])).length} yes, ${aura.songs.filter(x => (x.filed || []).includes(aura.options[1])).length} no, ${aura.songs.filter(x => x.filed === null).length} to do` : "");
+  $("question").textContent = grp.options ? grp.question : grp.name === "Has sax" ? "Listen, then file each song under every group it belongs in. These were picked because the model heard a sax."
+    : grp.name === "Melody a sax could play" ? "Listen, then file each song under every group it belongs in. These were picked for a clear tune a sax could double."
+    : "Listen, then file each song under every group it belongs in. These were picked for open space a sax could sit in.";
+  const card = $("card");
+  if (!s) { card.textContent = "No songs in this group."; $("list").innerHTML = ""; return; }
+  if (card.dataset.id === s.id && card.dataset.group === grp.name) {
+    // same song: refresh the buttons only, so the audio keeps playing
+    [...card.querySelectorAll(".answers button")].forEach((b, k) => {
+      b.className = k < opts(grp).length ? ((s.filed || []).includes(opts(grp)[k]) ? "on" : "")
+                                         : "none" + (s.filed && s.filed.length === 0 ? " on" : "");
+    });
+  } else {
+  card.dataset.id = s.id; card.dataset.group = grp.name;
+  card.innerHTML = "";
+  const h = document.createElement("h2"); h.textContent = s.title;
+  const a = document.createElement("p"); a.className = "artist"; a.textContent = s.artist || "";
+  const w = document.createElement("div"); w.className = "where";
+  w.textContent = `plays 30 s from ${fmt(s.start)}` + (s.where === "sax" ? " (just before the sax is strongest)" : " (cue C, the peak section)") + (s.why ? `  \u00b7  ${s.why}` : "");
+  const audio = document.createElement("audio"); audio.id = "audio"; audio.controls = true; audio.autoplay = true;
+  audio.src = clip(s.id, s.start);                                     // 30 s around what made the pipeline pick it
+  const lab = document.createElement("div"); lab.className = "label"; lab.textContent = grp.name === "Energy check" ? "Club energy" : grp.more ? "File under any of these (sax groups and / or the aura), or none" : grp.options ? "Does this song have the aura?" : "File this song under (pick any, or none)";
+  const ans = document.createElement("div"); ans.className = "answers";
+  opts(grp).forEach((nm, k) => {
+    const b = document.createElement("button");
+    b.textContent = `${k + 1}  ${nm}`;
+    b.className = (s.filed || []).includes(nm) ? "on" : "";
+    b.onclick = () => toggle(nm);
+    ans.append(b);
+  });
+  const none = document.createElement("button"); none.textContent = "0  None of these";
+  none.className = "none" + (s.filed && s.filed.length === 0 ? " on" : "");
+  none.onclick = () => setFiled([]);
+  if (!grp.options || grp.more) ans.append(none);
+  const note = document.createElement("textarea"); note.id = "note"; note.value = s.note || "";
+  note.placeholder = "Optional note on this song";
+  const saved = document.createElement("div"); saved.className = "saved";
+  let timer;
+  const save = async () => {
+    clearTimeout(timer); s.note = note.value.trim();
+    await fetch("/api/sax/note", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: s.id, note: note.value }) });
+    saved.textContent = "note saved";
+  };
+  note.oninput = () => { saved.textContent = ""; clearTimeout(timer); timer = setTimeout(save, 700); };
+  note.onblur = () => { if (note.value.trim() !== (s.note || "")) save(); };
+  const nav = document.createElement("div"); nav.className = "nav";
+  const prev = document.createElement("button"); prev.textContent = "← Previous"; prev.onclick = () => go(-1);
+  const next = document.createElement("button"); next.textContent = "Next →"; next.onclick = () => go(1);
+  const pos = document.createElement("span"); pos.textContent = `${n + 1} of ${grp.songs.length}`;
+  nav.append(prev, pos, next);
+  card.append(h, a, w, audio, wholeButton(audio, s.id, () => Math.floor(s.start)), lab, ans, note, saved, nav);
+  }
+  $("list").innerHTML = "";
+  grp.songs.forEach((song, k) => {
+    const b = document.createElement("button"); b.className = k === n ? "cur" : "";
+    const d = document.createElement("span"); d.className = "dot";
+    d.textContent = song.filed === null ? "·" : song.filed.length ? song.filed.map(x => SHORT[x] || ({ "Keep": "\u2713", "Remove": "\u2717", "Has the aura": "\u2713", "No aura": "\u2717", "Low energy": "\u2193", "Mid energy": "\u2192", "High energy": "\u2191" }[x] || "?")).join("") : "—";
+    const t = document.createElement("span"); t.className = "t";
+    t.textContent = `${song.artist ? song.artist + " – " : ""}${song.title}` + (song.note ? "  ✎ " + song.note : "");
+    b.append(d, t); b.onclick = () => { clearTimeout(advance); n = k; render(); };
+    $("list").append(b);
+  });
+}
+
+function go(d) { clearTimeout(advance); const len = groups[g].songs.length; n = (n + d + len) % len; render(); }
+
+let advance;
+async function setFiled(list) {
+  const s = groups[g].songs[n];
+  s.filed = list;
+  clearTimeout(advance);
+  const grp = groups[g];
+  const at = s.id;
+  advance = setTimeout(() => {      // moves on once you stop pressing; press another number first to add a group
+    const songs = groups[g].songs;
+    if (songs[n].id !== at) return;
+    const next = songs.findIndex((x, i) => i > n && x.filed === null);
+    n = next >= 0 ? next : Math.min(n + 1, songs.length - 1);
+    render();
+  }, 1200);
+  const post = (url, groups_) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: s.id, groups: groups_ }) });
+  if (grp.more) { await post("/api/sax/file", list.filter(x => names.includes(x))); await post("/api/aura/answer", list.filter(x => !names.includes(x))); }
+  else await post(grp.endpoint || (grp.options ? "/api/aura/answer" : "/api/sax/file"), list);
+  render();
+}
+function toggle(nm) {
+  const grp = groups[g], s = grp.songs[n], cur = s.filed || [];
+  if (grp.options && !grp.more) return setFiled(cur.includes(nm) ? [] : [nm]);          // aura: one answer, yes or no
+  if (grp.more && !names.includes(nm) && !cur.includes(nm)) return setFiled([...cur.filter(x => names.includes(x) || x === nm), nm]);   // aura yes and no exclude each other
+  setFiled(cur.includes(nm) ? cur.filter(x => x !== nm) : [...cur, nm]);
+}
+
+document.addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey || e.target.tagName === "TEXTAREA") return;
+  if (lookup) return;
+  const o = opts(groups[g]);
+  if (["1", "2", "3", "4", "5"].includes(e.key) && +e.key <= o.length) toggle(o[+e.key - 1]);
+  else if (e.key === "0" && (!groups[g].options || groups[g].more)) setFiled([]);
+  else if (e.key === "ArrowRight" || e.key === "Enter") go(1);
+  else if (e.key === "ArrowLeft") go(-1);
+  else if (e.key === " ") { const a = $("audio"); if (a) { e.preventDefault(); a.paused ? a.play() : a.pause(); } }
+});
+load();
+</script>
+</body>
+</html>
