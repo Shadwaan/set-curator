@@ -20,6 +20,9 @@ import roles
 from cluster import HERE
 
 LEFT_MIN = 0.5                       # axis position at or above this: clearly nearer your Dub songs (Dub sits at about +1.0, Deep Tech about +0.5)
+LEFT_MIN_ZAYAN = 1.0                 # songs that are only in Zayan's playlists need to sit clearly further left than that
+ZAYAN = {"beachbar", "beachbar classics (Zayan)", "Beachbar Unc", "Saville Row Disco"}
+GUITAR_SHARE = 1 / 3                 # guitar songs are sprinkled in: at most this share of Sanctuary
 CORE_MAX = 0.0                       # the retro house core must sit on the house-side of the axis
 RETRO_CRATES = {"Classic AIFF", "Oldies AIFF", "beachbar classics (Zayan) AIFF"}
 SUNSET_BPM = (106, 128)
@@ -29,16 +32,8 @@ GUITAR_TOP = 0.88                    # guitar songs: the top 12% of the library 
 
 def axis_now(tracks, ids, vecs, songs) -> dict:
     """leftfield.py's axis, recomputed over today's library but not saved (the saved one sets the groove-reset folders)."""
-    row = {i: n for n, i in enumerate(ids)}
-    reggae = json.loads((HERE / "reggae_all.json").read_text())
-    pl = lambda i: {p[:-5] if p.endswith(" AIFF") else p for p in tracks[i]["playlists"]}
-    left = [i for i in songs if "Dub" in pl(i) and reggae.get(i, 0) < 0.3 and i in row]
-    house = [i for i in songs if pl(i) & {"beachbar classics (Zayan)", "Classic", "Oldies"} and i in row]
-    unit = lambda v: v / np.linalg.norm(v)
-    cl, ch = unit(vecs[[row[i] for i in left]].mean(0)), unit(vecs[[row[i] for i in house]].mean(0))
-    raw = {i: float(vecs[row[i]] @ cl - vecs[row[i]] @ ch) for i in songs if i in row}
-    v = np.array(list(raw.values()))
-    return {i: (x - v.mean()) / v.std() for i, x in raw.items()}
+    import leftfield
+    return leftfield.scores(tracks, ids, vecs, songs)
 
 
 def guitar_scores(ids) -> dict:
@@ -82,12 +77,17 @@ def build():
     crates = lambda i: {p for p in tracks[i]["playlists"]}
     has_sax = lambda i: sx.get(i, {}).get("saxophone", 0) >= SAX_MIN or bool({"Has sax", "Melody a sax could play"} & set(filed.get(i) or []))
 
-    left = [i for i in songs if axis.get(i, -9) >= LEFT_MIN and i in energy]
+    short = lambda i: {p[:-5] if p.endswith(" AIFF") else p for p in tracks[i]["playlists"]}
+    zayan_only = lambda i: bool(short(i)) and short(i) <= ZAYAN
+    left = [i for i in songs if axis.get(i, -9) >= (LEFT_MIN_ZAYAN if zayan_only(i) else LEFT_MIN) and i in energy]
     fits = lambda i: SUNSET_BPM[0] <= roles.lane_bpm(tracks[i]["bpm"]) <= SUNSET_BPM[1] and tier(i) in ("Low", "Mid") and not reggae.get(i)
-    core = [i for i in songs if crates(i) & RETRO_CRATES and axis.get(i, 9) < CORE_MAX and fits(i)]
+    import leftfield
+    frozen = set(json.loads(leftfield.ANCHOR.read_text())["retro"]) if leftfield.ANCHOR.exists() else set()   # the retro core as first approved
+    core = [i for i in songs if (crates(i) & RETRO_CRATES or i in frozen) and axis.get(i, 9) < CORE_MAX and fits(i)]
     in_core = set(core)
     sax = [i for i in songs if i not in in_core and has_sax(i) and axis.get(i, 9) < 0.4 and fits(i)]
     gtr = [i for i in songs if i not in in_core and i not in set(sax) and guitar.get(i, 0) >= g_line and axis.get(i, 9) < 0.4 and fits(i)]
+    gtr = sorted(gtr, key=lambda i: -guitar[i])[: round((len(core) + len(sax)) * GUITAR_SHARE / (1 - GUITAR_SHARE))]
     return tracks, {"Left field": left, "Sanctuary": core + sax + gtr}, {"retro house core": core, "sax": sax, "guitar": gtr}, axis, guitar
 
 
