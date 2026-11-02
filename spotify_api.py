@@ -57,3 +57,21 @@ def create_playlist(name: str, tracks: list[dict], public: bool = False) -> dict
     for i in range(0, len(uris), 100):
         sp.playlist_add_items(playlist["id"], uris[i:i + 100])
     return {"url": playlist["external_urls"]["spotify"], "found": len(uris), "missing": missing}
+
+
+def update_playlist(playlist_id: str, tracks: list[dict]) -> dict:
+    """Replace the contents of an existing playlist you own with these tracks (same URL kept)."""
+    sp = client()
+    uris, missing = [], []
+    for t in tracks:
+        uri = t.get("spotify_uri") or find_uri(sp, t["artist"], t["title"])
+        if uri:
+            t["spotify_uri"] = uri
+            if uri not in uris:
+                uris.append(uri)
+        else:
+            missing.append(t)
+    sp.playlist_replace_items(playlist_id, uris[:100])
+    for i in range(100, len(uris), 100):
+        sp.playlist_add_items(playlist_id, uris[i:i + 100])
+    return {"url": f"https://open.spotify.com/playlist/{playlist_id}", "found": len(uris), "missing": missing}

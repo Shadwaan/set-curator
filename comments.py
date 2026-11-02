@@ -2,7 +2,9 @@
 Tag every song's Rekordbox comment with its high end and the playlists it is from, so both show
 in the track info on the deck:
 
-    [OPEN | Dub Reggae Bass Addict, Dub | AURA | SAX, SAX-ROOM] your own comment, if there was one
+    [OPEN | Dub Reggae Bass Addict, Dub | AURA | SAX, SAX-ROOM | BANGKOK, SWEATY | Dubstep] your own comment, if there was one
+
+The last part is the song's sound style (genre).
 
 SAX, SAX-MELODY and SAX-ROOM come from how you filed songs in the sax page (sax_filed.json), AURA from
 your aura answers (sax_aura.json).
@@ -43,6 +45,11 @@ def your_tags() -> dict[str, list[str]]:
     return out
 
 
+def acid_tags(merged) -> dict[str, list[str]]:
+    import acid
+    return acid.tags(merged)
+
+
 def playlists_of_song(own: str, kept: str, merged: dict[str, str], raw: dict) -> list[str]:
     """Your playlists for a song: this file's own first, in their existing order, then those of the song's other files."""
     members = [own, kept] + [c for c, k in merged.items() if k == kept]
@@ -54,6 +61,21 @@ def playlists_of_song(own: str, kept: str, merged: dict[str, str], raw: dict) ->
     return out
 
 
+VIBE_ORDER = ["BANGKOK", "BANGKOK?", "BEACHBAR", "BEACHBAR-CLUB", "SWEATY"]
+
+
+def genre_tags(ids) -> dict[str, str]:
+    """The sound style that sets each song apart from the rest of the library (Discogs-400 model on its stored embedding):
+    the style with the highest share, damped by how common that style is, so a house track is not just "House". Last in the tag."""
+    ids = list(ids)
+    classes, probs = cluster.style_predictions(ids)
+    lib = np.mean([probs[i] for i in ids], axis=0)
+    from collections import Counter as C
+    bare = C(c.split("---")[1] for c in classes)
+    pretty = lambda c: c.split("---")[1] if bare[c.split("---")[1]] == 1 else c.replace("---", " ")
+    return {i: pretty(classes[int(np.argmax(probs[i] / np.sqrt(lib + 1e-9)))]) for i in ids}
+
+
 def build_prefixes():
     tracks, ids, vecs = cluster.load(["Deep Tech FLAC"])
     songs, _, merged = cluster.merge_copies(tracks, ids, vecs)
@@ -63,6 +85,10 @@ def build_prefixes():
     lo, hi = np.percentile(list(score.values()), [100 / 3, 200 / 3])
     tag = lambda i: "OPEN" if score[i] > hi else "CLOSED" if score[i] < lo else "BAL"
     mine = your_tags()
+    acid_by = acid_tags(merged)
+    import vibes as vibe_groups
+    vibes = vibe_groups.tags(merged)                       # tags from the words in your notes and your Vibe check answers
+    genres = genre_tags(list(songs))
     out = {}
     for i in list(songs) + list(merged):
         src = merged.get(i, i)                                 # a copy takes its twin's reading
@@ -76,9 +102,16 @@ def build_prefixes():
             parts.append(", ".join(crates))
         if "AURA" in mine_tags:
             parts.append("AURA")
-        sax = [t for t in mine_tags if t.startswith("SAX")]
+        sax = [t for t in mine_tags if t.startswith("SAX")] + acid_by.get(src, [])
         if sax:
             parts.append(", ".join(sax))
+        v = [t for t in VIBE_ORDER if t in vibes.get(src, [])]
+        if any("beachbar" in c.lower() for c in crates):
+            v = [t for t in v if t != "BEACHBAR"]       # the playlist name in the tag already says it
+        if v:
+            parts.append(", ".join(v))
+        if genres.get(src):
+            parts.append(genres[src])                          # the sound style, always the last part
         out[i] = "[" + " | ".join(parts) + "]"
     return out
 

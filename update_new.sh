@@ -29,16 +29,9 @@ step energy_check.py sample                            # energy features for the
 
 if [ "$MODE" = "apply" ]; then
   step cues.py --apply                                 # hot cues A/B/C into Rekordbox (songs that already have cues are skipped)
-  # one folder per playlist of yours; the four new playlists get their folder, the others are rebuilt with the new songs
-  for P in $("$PY" -c "
-import json
-t = json.load(open('tracks.json'))
-print('\n'.join(sorted({p for x in t for p in x['playlists'] if p.endswith(('AIFF',))})).replace(' ', '@@'))"); do
-    NAME=${P//@@/ }
-    step cluster.py --per-playlist --only "$NAME" --exclude-playlist "Deep Tech FLAC" --apply
-  done
-else
-  step cluster.py --per-playlist --exclude-playlist "Deep Tech FLAC"      # preview of the per-playlist folders
+  # the per-playlist SC folders (SC / <your playlist> / ...) were retired on 2026-10-20: they only repeated your own playlists and used up the
+  # stick's limit of 1,000 lists and folders. cluster.py --per-playlist still works if you ever want one back.
+  :
 fi
 step roles.py $A --replace                             # SC / Set roles
 step roles.py --reggae $A --replace                    # SC / Dub & Reggae

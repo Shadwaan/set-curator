@@ -169,7 +169,15 @@ def main():
         return
     if args.apply:
         from rekordbox_write import write_hot_cues
-        result = write_hot_cues(json.loads(OUT.read_text()))
+        cues = json.loads(OUT.read_text())
+        rules = HERE / "playlist_rules.json"             # playlists whose songs already have the cues you want: detected for the measurements, never written
+        skip = set(json.loads(rules.read_text()).get("no_cues", [])) if rules.exists() else set()
+        if skip:
+            playlists = {t["id"]: t["playlists"] for t in json.loads((HERE / "tracks.json").read_text())}
+            kept = {i: v for i, v in cues.items() if not skip & set(playlists.get(i, []))}
+            print(f"{len(cues) - len(kept)} songs in {sorted(skip)} are not given cues")
+            cues = kept
+        result = write_hot_cues(cues)
         print(f"Hot cues written for {result['written']} tracks; skipped {result['skipped']}. Backup: {result['backup']}")
         return
 
@@ -182,12 +190,19 @@ def main():
         ids = [i for i in ids if i not in out]          # only songs with no cues yet
         print(f"{len(ids)} songs without detected cues")
     paths = analysis_paths_from_files({i: tracks[i] for i in ids})
+    if any(i not in paths for i in ids):                  # songs imported from a device: the file name inside their analysis is not the song's
+        by_id = analysis_paths()
+        paths.update({i: by_id[i] for i in ids if i not in paths and i in by_id})
     for n, i in enumerate(ids, 1):
         if i not in paths:
             print(f"[{n}/{len(ids)}] no Rekordbox analysis: {cluster.label_of(tracks[i])}")
             continue
-        bars = downbeats(paths[i])
-        cues = detect(bars, bar_energy(tracks[i]["path"], bars))
+        try:
+            bars = downbeats(paths[i])
+            cues = detect(bars, bar_energy(tracks[i]["path"], bars))
+        except Exception as e:
+            print(f"[{n}/{len(ids)}] could not read the analysis of {cluster.label_of(tracks[i])}: {e}")
+            continue
         out[i] = cues
         bb = cues["bars"]
         print(f"[{n}/{len(ids)}] A bar {bb['A']}, B {bb['B']}, C {bb['C']} of {len(bars)}"

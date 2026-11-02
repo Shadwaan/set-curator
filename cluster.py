@@ -179,10 +179,18 @@ def style_names(groups, probs, classes):
         if g not in names and s not in taken:
             names[g] = s
             taken.add(s)
+    for g, members in enumerate(groups):                  # every best style taken by a stronger group: share its best one, numbered below
+        if g not in names:
+            names[g] = int(np.argmax(np.mean([probs[i] for i in members], axis=0)))
     # "Reggae---Dub" -> "Dub", unless another parent genre has a "Dub" too
     bare = Counter(c.split("---")[1] for c in classes)
     pretty = lambda c: c.split("---")[1] if bare[c.split("---")[1]] == 1 else c.replace("---", " ")
-    return [pretty(classes[names[g]]) for g in range(len(groups))]
+    out, seen = [], Counter()
+    for g in range(len(groups)):
+        name = pretty(classes[names[g]])
+        seen[name] += 1
+        out.append(name if seen[name] == 1 else f"{name} {seen[name]}")
+    return out
 
 
 def label_of(t):

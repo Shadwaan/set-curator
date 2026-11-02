@@ -713,3 +713,46 @@ def restore_song_from_backup(cid: str, backup_path: str, playlist_name: str, wit
             d.engine.dispose()
     flush_wal()
     return {"restored": True, "title": content.Title, "copied": copied, "backup": str(backup)}
+
+
+def apply_content_edits(edits: dict[str, dict]) -> dict:
+    """Write edited titles and artists into Rekordbox: {content id: {"title": ..., "artist": ...}} (either is optional).
+    An artist is matched by its exact name and created when it does not exist yet. One transaction, one backup;
+    refuses while Rekordbox is running. The audio file and its tags are not touched."""
+    from pyrekordbox.db6 import tables as T
+
+    if not os.environ.get("SET_CURATOR_RB_DIR") and is_rekordbox_running():
+        raise RuntimeError("Close Rekordbox first -- it overwrites master.db with its in-memory copy")
+    backup = backup_master_db()
+    db = open_db()
+    changed = []
+    try:
+        usn = _next_usn(db, T.DjmdContent)
+        now = datetime.now(timezone.utc)
+        for cid, e in edits.items():
+            row = db.session.query(T.DjmdContent).filter_by(ID=cid).first()
+            if row is None:
+                continue
+            before = (row.Title, getattr(row, "ArtistName", None))
+            title, artist = (e.get("title") or "").strip(), (e.get("artist") or "").strip()
+            if title and title != row.Title:
+                row.Title = title
+            if artist:
+                a = db.session.query(T.DjmdArtist).filter_by(Name=artist).first()
+                if a is None:
+                    a = db.add_artist(name=artist)
+                    db.session.flush()
+                row.ArtistID = a.ID
+            row.updated_at = now
+            row.rb_local_usn = usn
+            usn += 1
+            changed.append((cid, before, (title or row.Title, artist or before[1])))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+    finally:
+        db.session.close()
+        db.engine.dispose()
+    flush_wal()
+    return {"changed": changed, "backup": str(backup)}

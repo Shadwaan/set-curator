@@ -91,17 +91,22 @@ def energy_folder(name, members, tracks, tier, energy):
     # "All" builds up by YOUR energy ranking (the score fitted to your ratings): lowest first, tempo only breaks ties
     blend = cluster.blend_key(eff)
     kids.append(playlist("All (low to high energy)", members, tracks, eff,
-                         key=lambda i: (round(energy[i], 2),) + blend(i)))
+                         key=lambda i: (TIERS.index(tier(i)), round(energy[i], 2)) + blend(i)))
     return {"name": name, "children": [k for k in kids if k]}
 
 
 def build():
     tracks, ids, merged, energy, reggae = load_state()
     import notes
-    tier = tiers_of(energy, ids, notes.tier_overrides(merged))
+    # your own word on a song's energy beats the formula: an Energy check rating first, then an unqualified note
+    rated = json.loads((HERE / "sax_energy.json").read_text()) if (HERE / "sax_energy.json").exists() else {}
+    override = dict(notes.tier_overrides(merged))
+    override.update({merged.get(i, i): v[0] for i, v in rated.items() if v})
+    tier = tiers_of(energy, ids, override)
     filed = json.loads((HERE / "sax_filed.json").read_text())
     aura = json.loads((HERE / "sax_aura.json").read_text())
     have = set(ids)
+    have_ids = have
     lost = [i for i in set(filed) | set(aura) if i not in have and i not in merged]
     def song(i):
         return merged.get(i, i)                     # a filed copy counts as the song that was kept
@@ -120,6 +125,25 @@ def build():
         sax["children"].append(reggae_tree)
     aura_ids = sorted({song(i) for i, v in aura.items() if v == ["Has the aura"] and song(i) in have and not reggae[song(i)]})
     aura_tree = energy_folder("Aura", aura_ids, tracks, tier, energy)
+    import vibes as vibe_groups
+    have = vibe_groups.members(merged)
+    build.vibes = []
+    import acid
+    acid_ids = [i for i in acid.confirmed(merged) if i in have_ids and not reggae[i]]
+    room_ids = [i for i in acid.room_members(merged) if i in have_ids and not reggae[i]]
+    if acid_ids or room_ids:
+        build.vibes.append({"name": "Acid", "children": [x for x in (energy_folder("Acid lines", acid_ids, tracks, tier, energy) if acid_ids else None,
+                                                                    energy_folder("Room for a 303", room_ids, tracks, tier, energy) if room_ids else None) if x]})
+    for group in ("Bangkok groove",):          # Beachbar is your beachbar playlist itself, so it gets no folder of its own
+        ids_ = [i for i in have[group] if i in have_ids and not reggae[i]]
+        if not ids_:
+            continue
+        folder = energy_folder(group, ids_, tracks, tier, energy)
+        if group == "Beachbar":
+            club = [i for i in have["Also works in a club"] if i in ids_]
+            if club:
+                folder["children"].append(playlist("Also works in a club", club, tracks, cluster.mix_bpm(club, tracks)))
+        build.vibes.append(folder)
     hard = [i for i in aura_ids if i in notes.listening(merged)]
     if hard:
         aura_tree["children"].append(playlist("Listening (hard to mix)", hard, tracks, cluster.mix_bpm(hard, tracks)))
@@ -142,6 +166,8 @@ def main():
     sax, aura_tree, tracks, lost, _ = build()
     show(sax)
     show(aura_tree)
+    for v in getattr(build, "vibes", []):
+        show(v)
     if lost:
         print(f"note: {len(lost)} filed songs are no longer in the library data (excluded or removed), skipped")
     if not args.apply:
@@ -154,7 +180,7 @@ def main():
             return {"name": node["name"], "children": [to_tracks(c) for c in node["children"]]}
         return {"name": node["name"], "tracks": [tracks[i] for i in node["tracks"]]}
 
-    for tree in (sax, aura_tree):
+    for tree in [sax, aura_tree] + getattr(build, "vibes", []):
         result = write_folder(to_tracks(tree), parent="SC", replace=True)
         print(f"Created SC / {tree['name']}: {result['folders']} folders, {result['playlists']} playlists, "
               f"{result['added']} tracks. Backup: {result['backup']}")

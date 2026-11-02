@@ -182,6 +182,25 @@ def sax_page():
     return resp
 
 
+_MERGED = None
+
+
+def _playlists_of(i: str) -> list[str]:
+    """Your playlists for a song, short names ("Dub", not "Dub AIFF"): its own, then those of its other files."""
+    global _MERGED
+    if _MERGED is None:
+        import cluster
+        _, _, _MERGED = cluster.merge_copies({k: dict(v) for k, v in lib.tracks.items()}, list(lib.ids), lib.vecs)
+    kept = _MERGED.get(i, i)
+    members = [i, kept] + [c for c, k in _MERGED.items() if k == kept]
+    out: list[str] = []
+    for m in members:
+        for p in lib.tracks.get(m, {}).get("playlists", []):
+            if p != "Deep Tech FLAC" and p not in out:
+                out.append(p)
+    return [p[:-5] if p.endswith(" AIFF") else p for p in out]
+
+
 def _peak(i: str) -> float:
     """Cue C (the peak section) of a song, or 30 s in."""
     import json
@@ -250,6 +269,87 @@ def sax_lists():
         out.append({"name": "Imports to check", "options": ["Keep", "Remove"], "endpoint": "/api/import/answer", "songs": cs,
                     "question": "Songs the File Fetcher import added that may be unwanted or doubled. Listen, then Keep or Remove. "
                                 "Remove only marks it for me; you remove it in Rekordbox."})
+    # the vibe check: songs that sound like your Bangkok groove / Beachbar songs (vibes.py), to tick any of your own words
+    import vibes as vibe_groups
+    cand = _read(vibe_groups.CANDIDATES)
+    answered_v = _read(vibe_groups.FILE)
+    vs = []
+    for i, why in cand.items():
+        if i not in lib.row:
+            continue
+        artist, title = lib.label(i)
+        vs.append({"id": i, "artist": artist, "title": title, "start": round(listen.get(i, _peak(i)), 1),
+                   "filed": answered_v.get(i), "note": notes.get(i, ""), "where": "C", "why": " + ".join(why)})
+    if vs:
+        out.append({"name": "Vibe check", "options": ["Bangkok groove", "Sweaty"], "multi": True, "endpoint": "/api/vibe/answer", "songs": vs,
+                    "question": "Songs that sound like your Bangkok groove songs. Tick every word that fits; none of these is fine."})
+    room_c = _read(HERE / "room303_candidates.json")
+    room_a = _read(HERE / "sax_303.json")
+    rs = []
+    for i, why in room_c.items():
+        if i not in lib.row:
+            continue
+        artist, title = lib.label(i)
+        rs.append({"id": i, "artist": artist, "title": title, "start": round(listen.get(i, _peak(i)), 1),
+                   "filed": None if i not in room_a else (["Room for a 303"] if room_a[i] else ["No"]),
+                   "note": notes.get(i, ""), "where": "C", "why": "; ".join(why)})
+    if rs:
+        out.append({"name": "303 room check", "options": ["Room for a 303", "No"], "endpoint": "/api/room303/answer", "songs": rs,
+                    "question": "Not acid itself, but space where you could play a live 303 over it. These sound like the songs "
+                                "you already said that about (Nova, Brake Root, Eye Drop, And So I Dance)."})
+    dec = _read(HERE / "groove_decisions.json")
+    dec_a = _read(HERE / "sax_decisions.json")
+    ds = []
+    for i, d in dec.items():
+        if i not in lib.row:
+            continue
+        artist, title = lib.label(i)
+        ds.append({"id": i, "artist": artist, "title": title, "start": round(listen.get(i, _peak(i)), 1), "filed": dec_a.get(i),
+                   "note": notes.get(i, ""), "where": "C", "why": d["why"]})
+    if ds:
+        out.append({"name": "My decisions", "options": ["Agree", "Change it"], "endpoint": "/api/decision/answer", "songs": ds,
+                    "question": "My decisions about your groove resets (which stay, which side of the left-field to house-side scale, "
+                                "which I would drop). Agree, or Change it and say why in the note."})
+    acid_c = _read(HERE / "acid_candidates.json")
+    acid_a = _read(HERE / "sax_acid.json")
+    acs = []
+    for i, why in acid_c.items():
+        if i not in lib.row:
+            continue
+        artist, title = lib.label(i)
+        acs.append({"id": i, "artist": artist, "title": title, "start": round(listen.get(i, _peak(i)), 1),
+                    "filed": None if i not in acid_a else (["Acid"] if acid_a[i] else ["Not acid"]),
+                    "note": notes.get(i, ""), "where": "C", "why": "; ".join(why)})
+    if acs:
+        out.append({"name": "Acid check", "options": ["Acid", "Not acid"], "endpoint": "/api/acid/answer", "songs": acs,
+                    "question": "Acid: the squelchy, resonant TB-303 bassline (acid house, acid techno, acid trance). "
+                                "These are the songs Discogs, the genre model or the title point to; Discogs tags whole releases, so it can be wrong."})
+    groove = _read(HERE / "groove_candidates.json")
+    roles_ans = _read(HERE / "sax_roles.json")
+    gs = []
+    for i, why in groove.items():
+        if i not in lib.row:
+            continue
+        artist, title = lib.label(i)
+        gs.append({"id": i, "artist": artist, "title": title, "start": round(listen.get(i, _peak(i)), 1),
+                   "filed": None if i not in roles_ans else (["Groove reset"] if roles_ans[i] else ["Not a reset"]),   # the page's own button names
+                   "note": notes.get(i, ""), "where": "C", "why": " + ".join(why)})
+    if gs:
+        out.append({"name": "Groove reset check", "options": ["Groove reset", "Not a reset"], "endpoint": "/api/role/answer", "songs": gs,
+                    "question": "A groove reset calms the floor down after a peak or heavy bass, with the groove still going. "
+                                "These sound like the two you already named (Epiphany, You Don't Know Me)."})
+    clubs = _read(vibe_groups.CLUB_CANDIDATES)
+    cs2 = []
+    for i, why in clubs.items():
+        if i not in lib.row:
+            continue
+        artist, title = lib.label(i)
+        cs2.append({"id": i, "artist": artist, "title": title, "start": round(listen.get(i, _peak(i)), 1),
+                    "filed": answered_v.get(i), "note": notes.get(i, ""), "where": "C", "why": " + ".join(why)})
+    if cs2:
+        out.append({"name": "Club check", "options": vibe_groups.CLUB_OPTIONS, "endpoint": "/api/vibe/answer", "songs": cs2,
+                    "question": "Your beachbar playlist's songs with the most club energy. Would it work in a club, at the right time? "
+                                "Or is it beachbar only?"})
     # songs found by the later searches, to file under the sax groups and/or the aura
     more = _read(HERE / "sax_more.json")
     songs = []
@@ -265,6 +365,9 @@ def sax_lists():
     if songs:
         out.append({"name": "More to check", "more": True, "options": SAX_GROUPS + AURA_OPTIONS, "songs": songs,
                     "question": "Songs I found by sound that you haven't judged. File under any sax group, the aura, both or neither."})
+    for g in out:
+        for song in g["songs"]:
+            song["playlists"] = _playlists_of(song["id"])
     return jsonify(groups=out, names=SAX_GROUPS)
 
 
@@ -323,6 +426,57 @@ def import_answer():
     ans = _read(SAX_IMPORT)
     ans[body["id"]] = [g for g in ("Keep", "Remove") if g in body["groups"]]
     SAX_IMPORT.write_text(json.dumps(ans, indent=1))
+    return jsonify(ok=True)
+
+
+@app.post("/api/vibe/answer")
+def vibe_answer():
+    import json
+    import vibes as vibe_groups
+    body = request.get_json()
+    ans = _read(vibe_groups.FILE)
+    ans[body["id"]] = [g for g in vibe_groups.NAMES + ["Beachbar only"] if g in body["groups"]]
+    vibe_groups.FILE.write_text(json.dumps(ans, indent=1))
+    return jsonify(ok=True)
+
+
+@app.post("/api/role/answer")
+def role_answer():
+    import json
+    body = request.get_json()
+    ans = _read(HERE / "sax_roles.json")
+    ans[body["id"]] = ["9 Groove resets"] if "Groove reset" in body["groups"] else []
+    (HERE / "sax_roles.json").write_text(json.dumps(ans, indent=1))
+    return jsonify(ok=True)
+
+
+@app.post("/api/acid/answer")
+def acid_answer():
+    import json
+    body = request.get_json()
+    ans = _read(HERE / "sax_acid.json")
+    ans[body["id"]] = ["Acid"] if "Acid" in body["groups"] else []
+    (HERE / "sax_acid.json").write_text(json.dumps(ans, indent=1))
+    return jsonify(ok=True)
+
+
+@app.post("/api/room303/answer")
+def room303_answer():
+    import json
+    body = request.get_json()
+    ans = _read(HERE / "sax_303.json")
+    ans[body["id"]] = ["Room for a 303"] if "Room for a 303" in body["groups"] else []
+    (HERE / "sax_303.json").write_text(json.dumps(ans, indent=1))
+    return jsonify(ok=True)
+
+
+@app.post("/api/decision/answer")
+def decision_answer():
+    import json
+    body = request.get_json()
+    ans = _read(HERE / "sax_decisions.json")
+    ans[body["id"]] = [g for g in ("Agree", "Change it") if g in body["groups"]]
+    (HERE / "sax_decisions.json").write_text(json.dumps(ans, indent=1))
     return jsonify(ok=True)
 
 

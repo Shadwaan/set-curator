@@ -61,14 +61,20 @@ textarea { width: 100%; font: inherit; color: var(--ink); background: var(--bg);
 <main>
   <p class="q" id="question"></p>
   <div class="card" id="card"></div>
-  <div class="hint">Keys: 1 sax, 2 melody, 3 room (press again to undo), 0 none of these, on the Aura tab 1 = has the aura and 2 = no aura, on More to check 1-3 sax groups and 4 / 5 aura yes / no (it moves on by itself about a second after your last press), &larr; &rarr; or Enter previous / next, Space play / pause. Everything saves as you go. In the list: S sax, M melody, R room, &mdash; none, &middot; not sorted yet.</div>
+  <div class="hint">Keys: 1 sax, 2 melody, 3 room (press again to undo), 0 none of these, on the Aura tab 1 = has the aura and 2 = no aura, on More to check 1-3 sax groups and 4 / 5 aura yes / no (single-choice tabs move on by themselves a second after your press; tick-box tabs wait for Done or Enter), &larr; &rarr; or Enter previous / next, Space play / pause. Everything saves as you go. In the list: S sax, M melody, R room, &mdash; none, &middot; not sorted yet.</div>
   <div class="list" id="list"></div>
 </main>
 <script>
 let groups = [], names = [], g = 0, n = 0;
 const $ = id => document.getElementById(id);
 const fmt = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+// Only one song ever plays: starting any player stops every other, and a player that is removed is silenced first.
+document.addEventListener("play", e => { document.querySelectorAll("audio").forEach(a => { if (a !== e.target) a.pause(); }); }, true);
+function silence() { document.querySelectorAll("audio").forEach(a => { a.pause(); a.removeAttribute("src"); a.load(); }); }
+window.addEventListener("pagehide", silence);
 const opts = grp => grp.options || names;
+const isMulti = grp => !grp.options || grp.more || grp.multi;      // tick boxes: any number can apply
+const boxed = (grp, nm, on) => isMulti(grp) ? (on ? "\u2611 " : "\u2610 ") : "";
 const SHORT = { "Has sax": "S", "Melody a sax could play": "M", "Room for a sax": "R" };
 const KEYS = ["Has sax", "Melody a sax could play", "Room for a sax"];
 
@@ -142,7 +148,7 @@ function renderLookup() {
     });
     row.append(h, a, fl, audio, status, wholeButton(audio, f.id, () => base), jumps, ans, au); box.append(row);
   });
-  card.dataset.id = ""; card.innerHTML = ""; card.append(box);
+  silence(); card.dataset.id = ""; card.innerHTML = ""; card.append(box);
   const keep = inp.value; inp.focus(); inp.setSelectionRange(keep.length, keep.length);
 }
 
@@ -186,23 +192,25 @@ function render() {
   if (card.dataset.id === s.id && card.dataset.group === grp.name) {
     // same song: refresh the buttons only, so the audio keeps playing
     [...card.querySelectorAll(".answers button")].forEach((b, k) => {
-      b.className = k < opts(grp).length ? ((s.filed || []).includes(opts(grp)[k]) ? "on" : "")
-                                         : "none" + (s.filed && s.filed.length === 0 ? " on" : "");
+      const on = k < opts(grp).length && (s.filed || []).includes(opts(grp)[k]);
+      b.className = k < opts(grp).length ? (on ? "on" : "") : "none" + (s.filed && s.filed.length === 0 ? " on" : "");
+      if (k < opts(grp).length) b.textContent = `${k + 1}  ${boxed(grp, opts(grp)[k], on)}${opts(grp)[k]}`;
     });
   } else {
+  silence();
   card.dataset.id = s.id; card.dataset.group = grp.name;
   card.innerHTML = "";
   const h = document.createElement("h2"); h.textContent = s.title;
   const a = document.createElement("p"); a.className = "artist"; a.textContent = s.artist || "";
   const w = document.createElement("div"); w.className = "where";
   w.textContent = `plays 30 s from ${fmt(s.start)}` + (s.where === "sax" ? " (just before the sax is strongest)" : " (cue C, the peak section)") + (s.why ? `  \u00b7  ${s.why}` : "");
-  const audio = document.createElement("audio"); audio.id = "audio"; audio.controls = true; audio.autoplay = true;
+  const audio = document.createElement("audio"); audio.id = "audio"; audio.controls = true;
   audio.src = clip(s.id, s.start);                                     // 30 s around what made the pipeline pick it
-  const lab = document.createElement("div"); lab.className = "label"; lab.textContent = grp.name === "Energy check" ? "Club energy" : grp.more ? "File under any of these (sax groups and / or the aura), or none" : grp.options ? "Does this song have the aura?" : "File this song under (pick any, or none)";
+  const lab = document.createElement("div"); lab.className = "label"; lab.textContent = grp.multi ? "Tick every word that fits (or none)" : grp.name === "Energy check" ? "Club energy" : grp.more ? "File under any of these (sax groups and / or the aura), or none" : grp.options ? "Does this song have the aura?" : "File this song under (pick any, or none)";
   const ans = document.createElement("div"); ans.className = "answers";
   opts(grp).forEach((nm, k) => {
     const b = document.createElement("button");
-    b.textContent = `${k + 1}  ${nm}`;
+    b.textContent = `${k + 1}  ${boxed(grp, nm, (s.filed || []).includes(nm))}${nm}`;
     b.className = (s.filed || []).includes(nm) ? "on" : "";
     b.onclick = () => toggle(nm);
     ans.append(b);
@@ -210,7 +218,11 @@ function render() {
   const none = document.createElement("button"); none.textContent = "0  None of these";
   none.className = "none" + (s.filed && s.filed.length === 0 ? " on" : "");
   none.onclick = () => setFiled([]);
-  if (!grp.options || grp.more) ans.append(none);
+  if (isMulti(grp)) ans.append(none);
+  const done = document.createElement("button"); done.className = "done"; done.textContent = "Done, next song \u2192 (Enter)";
+  done.style.cssText = "flex-basis:100%;font-weight:600;padding:12px;border-color:var(--accent)";
+  done.onclick = () => { const songs = groups[g].songs; if (s.filed === null) s.filed = []; const nx = songs.findIndex((x, i) => i > n && x.filed === null); n = nx >= 0 ? nx : Math.min(n + 1, songs.length - 1); render(); };
+  if (isMulti(grp)) ans.append(done);
   const note = document.createElement("textarea"); note.id = "note"; note.value = s.note || "";
   note.placeholder = "Optional note on this song";
   const saved = document.createElement("div"); saved.className = "saved";
@@ -228,15 +240,17 @@ function render() {
   const next = document.createElement("button"); next.textContent = "Next →"; next.onclick = () => go(1);
   const pos = document.createElement("span"); pos.textContent = `${n + 1} of ${grp.songs.length}`;
   nav.append(prev, pos, next);
-  card.append(h, a, w, audio, wholeButton(audio, s.id, () => Math.floor(s.start)), lab, ans, note, saved, nav);
+  const from = document.createElement("p"); from.className = "artist"; from.textContent = "From: " + ((s.playlists || []).join(", ") || "no playlist");
+  card.append(h, a, from, w, audio, wholeButton(audio, s.id, () => Math.floor(s.start)), lab, ans, note, saved, nav);
+  audio.play().catch(() => {});                                                      // starts only once it is on the page
   }
   $("list").innerHTML = "";
   grp.songs.forEach((song, k) => {
     const b = document.createElement("button"); b.className = k === n ? "cur" : "";
     const d = document.createElement("span"); d.className = "dot";
-    d.textContent = song.filed === null ? "·" : song.filed.length ? song.filed.map(x => SHORT[x] || ({ "Keep": "\u2713", "Remove": "\u2717", "Has the aura": "\u2713", "No aura": "\u2717", "Low energy": "\u2193", "Mid energy": "\u2192", "High energy": "\u2191" }[x] || "?")).join("") : "—";
+    d.textContent = song.filed === null ? "·" : song.filed.length ? song.filed.map(x => SHORT[x] || ({ "Room for a 303": "3", "No": "\u2013", "Agree": "\u2713", "Change it": "\u270e", "Acid": "A", "Not acid": "\u2013", "Groove reset": "r", "Not a reset": "\u2013", "Beachbar only": "\u2013", "Bangkok groove": "B", "Beachbar": "b", "Also works in a club": "c", "Sweaty": "s", "Keep": "\u2713", "Remove": "\u2717", "Has the aura": "\u2713", "No aura": "\u2717", "Low energy": "\u2193", "Mid energy": "\u2192", "High energy": "\u2191" }[x] || "?")).join("") : "—";
     const t = document.createElement("span"); t.className = "t";
-    t.textContent = `${song.artist ? song.artist + " – " : ""}${song.title}` + (song.note ? "  ✎ " + song.note : "");
+    t.textContent = `${song.artist ? song.artist + " – " : ""}${song.title}` + ((song.playlists || []).length ? "  · " + song.playlists.join(", ") : "") + (song.note ? "  ✎ " + song.note : "");
     b.append(d, t); b.onclick = () => { clearTimeout(advance); n = k; render(); };
     $("list").append(b);
   });
@@ -251,7 +265,7 @@ async function setFiled(list) {
   clearTimeout(advance);
   const grp = groups[g];
   const at = s.id;
-  advance = setTimeout(() => {      // moves on once you stop pressing; press another number first to add a group
+  if (!isMulti(grp)) advance = setTimeout(() => {      // single-choice tabs move on by themselves; tick tabs wait for Done / Enter
     const songs = groups[g].songs;
     if (songs[n].id !== at) return;
     const next = songs.findIndex((x, i) => i > n && x.filed === null);
@@ -265,7 +279,7 @@ async function setFiled(list) {
 }
 function toggle(nm) {
   const grp = groups[g], s = grp.songs[n], cur = s.filed || [];
-  if (grp.options && !grp.more) return setFiled(cur.includes(nm) ? [] : [nm]);          // aura: one answer, yes or no
+  if (grp.options && !grp.more && !grp.multi) return setFiled(cur.includes(nm) ? [] : [nm]);          // aura: one answer, yes or no
   if (grp.more && !names.includes(nm) && !cur.includes(nm)) return setFiled([...cur.filter(x => names.includes(x) || x === nm), nm]);   // aura yes and no exclude each other
   setFiled(cur.includes(nm) ? cur.filter(x => x !== nm) : [...cur, nm]);
 }
@@ -275,7 +289,7 @@ document.addEventListener("keydown", e => {
   if (lookup) return;
   const o = opts(groups[g]);
   if (["1", "2", "3", "4", "5"].includes(e.key) && +e.key <= o.length) toggle(o[+e.key - 1]);
-  else if (e.key === "0" && (!groups[g].options || groups[g].more)) setFiled([]);
+  else if (e.key === "0" && (!groups[g].options || groups[g].more || groups[g].multi)) setFiled([]);
   else if (e.key === "ArrowRight" || e.key === "Enter") go(1);
   else if (e.key === "ArrowLeft") go(-1);
   else if (e.key === " ") { const a = $("audio"); if (a) { e.preventDefault(); a.paused ? a.play() : a.pause(); } }

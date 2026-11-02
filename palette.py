@@ -28,8 +28,8 @@ def build():
     have, mean, comps = {}, None, None
     if OUT.exists():
         d = np.load(OUT)
-        off = d["offsets"]
-        have = {str(i): d["data"][off[n]:off[n + 1]] for n, i in enumerate(d["ids"])}
+        off, data = d["offsets"], d["data"]                   # one read of the array; d["data"] inside the loop re-reads it for every song
+        have = {str(i): data[off[n]:off[n + 1]] for n, i in enumerate(d["ids"])}
         mean, comps = d["mean"], d["components"]
     todo = [i for i in ids if i not in have]
     raw = {}
@@ -64,8 +64,8 @@ def load() -> dict[str, np.ndarray]:
     if not OUT.exists():
         return {}
     d = np.load(OUT)
-    off = d["offsets"]
-    return {str(i): d["data"][off[n]:off[n + 1]].astype(np.float32) for n, i in enumerate(d["ids"])}
+    off, data = d["offsets"], d["data"]
+    return {str(i): data[off[n]:off[n + 1]].astype(np.float32) for n, i in enumerate(d["ids"])}
 
 
 def similarity(sections: dict[str, np.ndarray], query: str, ids: list[str]) -> np.ndarray:

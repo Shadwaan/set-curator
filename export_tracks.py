@@ -28,6 +28,17 @@ def rekordbox_dir() -> Path:
     raise SystemExit("Rekordbox only runs on Windows and macOS")
 
 
+def playlist_rules() -> tuple[set[str], dict[str, str]]:
+    """Optional playlist_rules.json beside this file: {"ignore": [playlist names that are only histories],
+    "same_as": {"a copy's name": "the playlist it counts as"}}. Ignored playlists never become a crate; a same_as playlist's songs
+    are filed under the other name, so the curator sees one crate."""
+    path = Path(__file__).with_name("playlist_rules.json")
+    if not path.exists():
+        return set(), {}
+    rules = json.loads(path.read_text(encoding="utf-8"))
+    return set(rules.get("ignore", [])), dict(rules.get("same_as", {}))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(Path(__file__).with_name("tracks.json")))
@@ -57,7 +68,10 @@ def main():
                 p = all_playlists.get(str(p.ParentID))
             return False
 
-        playlist_names = {pid: p.Name for pid, p in all_playlists.items() if not generated(p)}
+        ignore, same_as = playlist_rules()
+        rules_file = Path(__file__).with_name("playlist_rules.json")
+        args.ignore_folder = args.ignore_folder + (json.loads(rules_file.read_text()).get("ignore_folders", []) if rules_file.exists() else [])
+        playlist_names = {pid: same_as.get(p.Name, p.Name).strip() for pid, p in all_playlists.items() if not generated(p) and p.Name not in ignore}
 
         tracks = []
         for c in db.session.query(tables.DjmdContent).all():
@@ -69,7 +83,7 @@ def main():
                 "key": c.KeyName or "",
                 "length": c.Length or 0,
                 "path": c.FolderPath or "",
-                "playlists": [playlist_names[p] for p in playlists.get(str(c.ID), []) if p in playlist_names],
+                "playlists": list(dict.fromkeys(playlist_names[p] for p in playlists.get(str(c.ID), []) if p in playlist_names)),
             })
         db.session.close()
         db.engine.dispose()

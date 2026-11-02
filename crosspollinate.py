@@ -4,9 +4,11 @@ whose playlists are just its tempo bands ("120-128"):
 
   Bridges/            for each pair of your playlists that genuinely overlap: the
                       tracks from either that sit closest to the other (whole-track
-                      sound) plus tracks in both -- for moving a set between crates
-  Bridges (palette)/  the same, judged by shared sounds (palette matching), with the
-                      threshold set to let through the same share of tracks
+                      sound) plus tracks in both -- for moving a set between crates.
+                      Only the strongest pairs are kept (--bridge-budget, 140 lists)
+  Bridges (palette)/  only with --palette-bridges: the same, judged by shared sounds
+                      (palette matching), with the threshold set to let through the
+                      same share of tracks
   Moods/              the whole library by Essentia mood (Dark & Driving, Peak Time,
                       Laid-back, ...)
   (Mood palettes were merged into Set arcs, see roles.py --arcs)
@@ -61,10 +63,12 @@ def palette_matrix(ids) -> np.ndarray:
     return np.stack([palette.similarity(sections, i, ids) for i in ids])
 
 
-def bridges(tracks, ids, vecs, threshold, width, method="averaged"):
+def bridges(tracks, ids, vecs, threshold, width, method="averaged", budget=None):
     """method "averaged": whole-track fingerprints, `threshold` as given.
     method "palette": shared sounds section by section, with the threshold moved to
-    the palette score that is exactly as selective as `threshold` is for averaged."""
+    the palette score that is exactly as selective as `threshold` is for averaged.
+    `budget`: keep only the strongest pairs, as many as fit in that many folders+playlists (a pair is as strong as
+    its thinner side, since a bridge needs tracks on both sides)."""
     row = {i: n for n, i in enumerate(ids)}
     sims = vecs @ vecs.T
     same_audio = sims >= 0.999
@@ -85,7 +89,9 @@ def bridges(tracks, ids, vecs, threshold, width, method="averaged"):
         threshold = float(np.quantile(best_cross(sims), 1 - share))
         print(f"palette bridges: threshold {threshold:.3f}, letting through the same {share:.0%} of tracks "
               f"as averaged does at its threshold")
-    names = sorted({p for i in ids for p in tracks[i]["playlists"]}, key=str.lower)
+    rules = HERE / "playlist_rules.json"                  # "no_bridges": crates whose songs are not paired with other crates (it would add hundreds of folders)
+    skip = set(json.loads(rules.read_text()).get("no_bridges", [])) if rules.exists() else set()
+    names = sorted({p for i in ids for p in tracks[i]["playlists"]} - skip, key=str.lower)
     members = {p: {i for i in ids if p in tracks[i]["playlists"]} for p in names}
     out = []
     for a, b in combinations(names, 2):
@@ -101,8 +107,18 @@ def bridges(tracks, ids, vecs, threshold, width, method="averaged"):
         if len(near_a) >= 2 and len(near_b) >= 2:
             folder = tempo_folder(f"{short(a)} × {short(b)}", near_a + near_b + shared, tracks, width, 4)
             if folder:
-                out.append(folder)
-    return out
+                out.append((min(len(near_a), len(near_b)), len(near_a) + len(near_b), folder))
+    out.sort(key=lambda x: (-x[0], -x[1], x[2]["name"].lower()))
+    kept, used = [], 0
+    for _, _, folder in out:
+        size = 1 + len(folder["children"])
+        if budget is not None and used + size > budget:
+            continue
+        kept.append(folder)
+        used += size
+    if budget is not None:
+        print(f"bridges ({method}): kept the {len(kept)} strongest of {len(out)} pairs, {used} lists (budget {budget})")
+    return sorted(kept, key=lambda f: f["name"].lower())
 
 
 def mood_scores(ids) -> np.ndarray:
@@ -236,6 +252,9 @@ def main():
     ap.add_argument("--bridge-threshold", type=float, default=0.90, help="similarity for a bridge track")
     ap.add_argument("--bpm-width", type=float, default=8, help="max BPM spread within a playlist")
     ap.add_argument("--exclude-playlist", action="append", default=["Deep Tech FLAC"], metavar="NAME")
+    ap.add_argument("--bridge-budget", type=int, default=140, metavar="LISTS",
+                    help="keep only the strongest bridge pairs, as many as fit in this many folders+playlists (0 = all)")
+    ap.add_argument("--palette-bridges", action="store_true", help="also write Bridges (palette), the same pairs judged by shared sounds")
     ap.add_argument("--apply", action="store_true", help="write into the existing SC folder")
     ap.add_argument("--replace", action="store_true", help="rebuild SC / Cross-pollination if it already exists")
     args = ap.parse_args()
@@ -244,13 +263,14 @@ def main():
     ids, vecs, merged = cluster.merge_copies(tracks, ids, vecs)
     print(f"{len(merged)} extra copies of songs merged (one entry per song)")
     z = mood_scores(ids)
-    tree = {"name": "Cross-pollination", "children": [
-        {"name": "Bridges", "children": bridges(tracks, ids, vecs, args.bridge_threshold, args.bpm_width)},
-        {"name": "Bridges (palette)", "children": bridges(tracks, ids, vecs, args.bridge_threshold, args.bpm_width,
-                                                          "palette")},
-        {"name": "Moods", "children": moods(tracks, ids, z, args.bpm_width)},
-        {"name": "Relatives", "children": relatives(tracks, ids, vecs)},
-    ]}
+    budget = args.bridge_budget or None
+    folders = [{"name": "Bridges", "children": bridges(tracks, ids, vecs, args.bridge_threshold, args.bpm_width, budget=budget)}]
+    if args.palette_bridges:
+        folders.append({"name": "Bridges (palette)", "children": bridges(tracks, ids, vecs, args.bridge_threshold, args.bpm_width,
+                                                                        "palette", budget=budget)})
+    folders += [{"name": "Moods", "children": moods(tracks, ids, z, args.bpm_width)},
+                {"name": "Relatives", "children": relatives(tracks, ids, vecs)}]
+    tree = {"name": "Cross-pollination", "children": folders}
 
     def show(node, depth=0):
         pad = "    " * depth

@@ -30,7 +30,9 @@ from crosspollinate import tempo_folder
 
 FEATURES = HERE / "roles_features.json"
 ROLES = ["1 Openers", "2 Warmers", "3 Momentum builders", "4 Crowd attractors", "5 Peak time", "6 Sustainers",
-         "7 Moments", "8 Closers"]
+         "7 Moments", "8 Closers", "9 Groove resets"]
+SCORED = ROLES[:8]            # the formulas fill these; "9 Groove resets" (calm people down after a peak) is only ever
+GROOVE_RESET = ROLES[8]       # filled from your notes and the songs you confirm, never from a formula
 
 
 def pitch_clarity(path: str, start: float, end: float) -> float:
@@ -186,28 +188,29 @@ def assign(ids, feats, models, bpms, playlists=None, no_drive=None, song_nudges=
     for n, crates in enumerate(playlists or []):
         for crate in crates:
             for role, push in LEANS.get(crate, []):
-                scores[n, ROLES.index(role)] += push
+                scores[n, SCORED.index(role)] += push
     # your notes on single songs ("good sustainer"), see notes.py
     for n, i in enumerate(ids):
         for role, push in (song_nudges or {}).get(i, []):
-            scores[n, ROLES.index(role)] += push
+            if role in SCORED:                                  # "9 Groove resets" has no score column: it comes from your notes only
+                scores[n, SCORED.index(role)] += push
     # songs you flagged "hard to mix" are for listening: only Openers, Moments and Closers
     for n, i in enumerate(ids):
         if i in (listening or ()):
-            for role in ROLES:
+            for role in SCORED:
                 if role not in ("1 Openers", "7 Moments", "8 Closers"):
-                    scores[n, ROLES.index(role)] -= 100
+                    scores[n, SCORED.index(role)] -= 100
     # reggae and dub songs (no_drive) are good for opening and warming but don't build momentum or
     # drive a peak, so those two roles are closed to them
     for n, blocked in enumerate(no_drive or []):
         if blocked:
             for role in ("3 Momentum builders", "5 Peak time"):
-                scores[n, ROLES.index(role)] -= 100
+                scores[n, SCORED.index(role)] -= 100
     # every song goes to its closest role, however clear the fit, so nothing has to
     # be hunted for outside the folders
     roles = {r: [] for r in ROLES}
     for i, row in zip(ids, scores):
-        roles[ROLES[row.argmax()]].append(i)
+        roles[SCORED[row.argmax()]].append(i)
     return roles
 
 
@@ -292,15 +295,26 @@ def main():
                    [tracks[i]["playlists"] for i in ids], [is_reggae(i, reggae, tracks) for i in ids],
                    notes.role_nudges(merged), notes.listening(merged))
     moved = apply_corrections(roles, ids)
+    named = notes.explicit_roles(merged)                        # roles you named in notes: the first is the song's main role
+    for i, rl in named.items():
+        main = next((r for r in rl if r != GROOVE_RESET), None)   # a groove reset is only ever an extra role
+        if i in set(ids) and main in roles and i not in roles[main]:
+            for members in roles.values():
+                if i in members:
+                    members.remove(i)
+            roles[main].append(i)
+    also = {r: [i for i, rl in named.items() if i in set(ids) and r in rl and i not in roles[r]] for r in roles}
+    roles_multi = {r: roles[r] + also[r] for r in roles}        # role folders and the dub tree list a song in every role you named
+    print(f"{sum(len(v) for v in also.values())} extra role placements from your notes")
     if moved:
         print(f"{moved} songs placed by your corrections")
 
     if args.reggae:
-        tree = reggae_tree(tracks, roles, [i for i in ids if is_reggae(i, reggae, tracks)], args.bpm_width)
+        tree = reggae_tree(tracks, roles_multi, [i for i in ids if is_reggae(i, reggae, tracks)], args.bpm_width)
     elif args.arcs:
         tree = arcs(tracks, songs, roles)
     else:
-        tree = role_folders(tracks, ids, roles, args.bpm_width)
+        tree = role_folders(tracks, ids, roles_multi, args.bpm_width)
 
     if not args.apply:
         print(f"Preview only. Add --apply to write SC / {tree['name']} into Rekordbox.")
@@ -318,12 +332,12 @@ def main():
 
 
 def arcs(tracks, songs, roles, width=8, min_tracks=2):
-    """Set arcs: Mood > your playlist > (sound style) > [tempo lane] > All, then the roles in
-    set order. A family spanning several tempo lanes gets a folder per lane (half-time
-    folded towards the family's tempo), so moving from role to role keeps both the palette
-    and the tempo. "All" holds every song of the lane and "Other tempos" the songs that fit
-    no lane, so no song is left out. This is the old Mood palettes folder with the roles added."""
-    from crosspollinate import mood_scores, mood_tree, palette_families, palette_matrix
+    """Set arcs: Mood > [tempo lane] > All, then the roles in set order. Every song of a mood is one
+    pool (your playlist and the sound style are in the song's comment, not in folders: 2026-10-23, to
+    keep the stick under its limit of 1,000 lists). A mood spanning several tempo lanes gets a folder per
+    lane (half-time folded towards the mood's tempo). "All" holds every song of the lane and "Other tempos"
+    the songs that fit no lane, so no song is left out."""
+    from crosspollinate import MOODS, mood_scores, palette_families, palette_matrix
     role_of = {i: role for role, members in roles.items() for i in members}
 
     def role_playlists(members, eff):
@@ -354,7 +368,11 @@ def arcs(tracks, songs, roles, width=8, min_tracks=2):
         return {"name": name, "children": children} if children else None
 
     families = palette_families(tracks, songs, palette_matrix(songs), mood_scores(songs))
-    tree = {"name": "Set arcs", "children": mood_tree(families, leaf)}
+    by_mood = {}
+    for f in families:
+        by_mood.setdefault(f["mood"], set()).update(f["members"])
+    moods = [m for m in (leaf(mood, {"members": sorted(by_mood[mood])}) for mood in MOODS.values() if by_mood.get(mood)) if m]
+    tree = {"name": "Set arcs", "children": moods}
 
     def show(node, depth=0):
         pad = "    " * depth
@@ -371,6 +389,18 @@ def arcs(tracks, songs, roles, width=8, min_tracks=2):
 def role_folders(tracks, ids, roles, width):
     tree = {"name": "Set roles", "children": []}
     for role, members in roles.items():
+        if role == GROOVE_RESET:
+            if not members:
+                continue
+            import leftfield                                   # resets for left-field sets and for house-side sets are kept apart
+            sides = [tempo_folder(side, [i for i in members if leftfield.side(i) == side], tracks, width, 2, keep_rest=True)
+                     for side in ("House-side", "Left-field")]
+            folder = {"name": role, "children": [x for x in sides if x]}
+            tree["children"].append(folder)
+            print(f"\n{role}  ({len(members)} tracks)")
+            for sub in folder["children"]:
+                print(f"    {sub['name']}: " + ", ".join(f"{p['name']} ({len(p['tracks'])})" for p in sub["children"]))
+            continue
         folder = tempo_folder(role, members, tracks, width, 5) or {"name": role, "children": []}
         placed = {i for p in folder["children"] for i in p["tracks"]}
         rest = sorted((i for i in members if i not in placed), key=lambda i: tracks[i]["bpm"])
@@ -380,7 +410,7 @@ def role_folders(tracks, ids, roles, width):
         print(f"\n{role}  ({len(members)} tracks)")
         for p in folder["children"]:
             print(f"    {p['name']}  ({len(p['tracks'])})  " + ", ".join(label_of(tracks[i])[:32] for i in p["tracks"][:2]))
-    unassigned = len(ids) - sum(len(v) for v in roles.values())
+    unassigned = len(ids) - len({i for v in roles.values() for i in v})
     print(f"\n{unassigned} tracks fit no role strongly and are left out")
     return tree
 
